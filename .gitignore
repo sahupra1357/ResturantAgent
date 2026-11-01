@@ -1,0 +1,12 @@
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/models
+.venv
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+.gstack/
+data/runs/
+.DS_Store
