@@ -1,188 +1,226 @@
 # Restaurant Ops Agents
 
-A multi-agent system for an 80-seat bistro that forecasts demand, manages perishable inventory, places supplier
-orders and re-plans the menu when something goes wrong. A supervisor graph (LangGraph) coordinates five agents; all
-numbers come from a deterministic layer (LightGBM quantile forecasts, a MILP order optimizer, FEFO stock maths), every
-action passes a constraint checker, and big decisions wait for the chef. A day-by-day simulator injects disruptions and
-compares the agents against a fixed-par-level baseline.
+A real-time, multi-agent system for an 80-seat bistro. A simulated dining floor and an online-order channel
+generate orders. Five agents (Order, Inventory, Forecasting, Procurement and Menu) react to each order on one event bus:
+they route items to kitchen stations, deplete stock, forecast demand, buy supplies and adjust the menu. The manager
+watches every decision and its reason live, and approves or rejects the ones that need a human.
 
 ## Design principle
 
 Numbers come from models and rules; judgment comes from agents. An agent may propose any action, but every action
-passes the constraint checker before it executes.
+passes the constraint checker before it executes. Agents call tools; tools return numbers.
 
 | Layer | Responsible for | Never does |
 | --- | --- | --- |
-| Forecasting models | Covers and dish mix per meal period, with P10/P50/P90 bands | Business decisions |
-| Optimizer | Order quantities, supplier split, prep quantities | Interpret unusual situations |
+| Forecasting models | Covers and dish mix per meal period, P10/P50/P90 (LightGBM quantile) | Business decisions |
+| Optimizer / kitchen-load model | PO quantities and supplier split (MILP); ready-time quotes (queue model) | Interpret unusual situations |
 | Deterministic constraints | Shelf life, FEFO, min order, budget, station capacity, allergens | Get overridden by an LLM |
-| LLM agents | Interpret anomalies, compare alternatives, negotiate, explain, escalate | Arithmetic or stock counts |
+| LLM agents | Interpret anomalies, compare alternatives, explain, escalate | Arithmetic or stock counts |
 
 ## Architecture
 
 ```
- +-------------------------------------------------------------------------+
- |  Streamlit UI (ui/app.py)    CLI (sim/run.py)    FastAPI (tools/api.py) |
- +------------------------------+------------------------------------------+
-                                |
- +------------------------------v------------------------------------------+
- |  Simulator (sim/): World, disruptions, mock vendors, baseline policy,     |
- |  metrics.   Copies the seeded DB per policy: data/runs/{run_id}_{policy}  |
- +------------------------------+------------------------------------------+
-                                | one cycle per morning + per event
- +------------------------------v------------------------------------------+
- |  LangGraph supervisor (agents/supervisor.py)                              |
- |   sense -> Forecast Analyst -> Inventory -> Purchasing -> Menu -> Prep    |
- |        (live LLM ReAct agents, or rule-based mock policies)               |
- |                         |                                                 |
- |                         v                                                 |
- |   Constraint checker (core/constraints.py) -- blocked -> retry once       |
- |                         |                                                 |
- |                         v                                                 |
- |   Approval queue (interrupt) -- chef approves / rejects + note            |
- |                         |                                                 |
- |                         v                                                 |
- |   Execute + decision log + trace (decisions, trace tables)                |
- +------------------------------+------------------------------------------+
-                                | agents call tools, tools return numbers
- +------------------------------v------------------------------------------+
- |  Tools layer (tools/registry.py, LangChain tools + FastAPI)               |
- +------------------------------+------------------------------------------+
- +------------------------------v------------------------------------------+
- |  Deterministic core (core/): forecasting, inventory, optimizer,           |
- |  constraints, menu, prep        -- no LLM imports                         |
- +------------------------------+------------------------------------------+
-                                |
-                      SQLite (data/restaurant.db)
+  Dining floor (guest simulator,     Online order page          Manager dashboard
+  hand-placed orders)                (quote before checkout)    (decision feed, approval queue, KPIs)
+        |  order.submitted                 |                          ^  WebSocket: every event
+        v                                  v                          |  REST: approve / reject / edit
+ +------------------------------------------------------------------------------------------------+
+ |  Event bus: Redis Streams (ro:events:{service}) or in-process queue  +  append-only event_log  |
+ +------------------------------------------------------------------------------------------------+
+   |            |               |                 |                  |                 ^
+   v            v               v                 v                  v                 |
+ Order       Inventory      Forecasting       Procurement          Menu         decision.proposed
+ agent       agent          agent             agent                agent        decision.resolved
+ parse,      FEFO deplete,  15-min revision,  open POs, quotes,    86 / special,       |
+ allergens,  stock.low,     tomorrow +        draft PO, re-plan    last-N flags        |
+ route, fire lot.expiring   signals           on rejection                             |
+   |            |               |                 |                  |                 |
+   +------------+---------------+--------+--------+------------------+                 |
+                                         v proposals                                   |
+                 Coordinator (LangGraph): dedupe -> constraint check + cross-agent conflicts
+                                          -> approval interrupt (timeout = safe default) -> verify -> execute
+                                         |
+              Tools layer (tools/registry.py, live/tools.py): every number the agents use
+                                         |
+     Deterministic core: forecasting (LightGBM), optimizer (MILP), constraints, FEFO inventory,
+                         kitchen-load / ETA model (live/kitchen.py)            -- no LLM imports
+                                         |
+                       SQLite (one copy of the seeded DB per service: data/live/{service_id}.db)
 ```
+
+The hot path is deterministic: an order is parsed, allergen-checked and routed to its stations in well under a
+millisecond (target < 2 s), and stock depletion per fired item is sub-millisecond (target < 500 ms). LLM reasoning,
+when enabled, runs on a worker thread and only reviews the Menu, Procurement and Forecasting agents' rule-based
+candidates. The floor never waits on a model.
+
+## The five agents
+
+| Agent | Triggered by | Decides | Tools | Needs the manager |
+| --- | --- | --- | --- | --- |
+| Order | `order.submitted`, `kitchen.load`, `quote.updated` | Parses mods and allergies, allergen-checks each item, routes it to a station, sets course fire times; asks to throttle online orders when slammed | parse_order, allergen_check, route_to_station, station_queue | Allergen conflict it can't resolve (timeout: item dropped); online throttle (timeout: no change); comps |
+| Inventory | every `item.fired`; hourly sweep | Depletes by recipe BOM (FEFO), flags low stock vs tonight's forecast and lots near expiry, variance; quarantines on cooler failure | deplete_by_recipe, stock_by_lot, expiry_risk, variance_report | Discards over $50 (timeout: discard, food safety) |
+| Forecasting | every 15 service min; nightly; weather alerts | Revises tonight's covers from what's seated; tomorrow's forecast with the signals that matter; adjusts tomorrow on a big miss | forecast_covers, forecast_dish_mix, reservations, weather, signal_report | No (advisory) |
+| Procurement | `stock.low`, supplier shortfall, forecast miss, manager rejection | Checks open POs and lead times, compares supplier quotes, drafts POs, picks fallbacks, re-plans on rejection | optimize_orders, supplier_quotes, open_pos, draft_po (send_po runs in the coordinator) | POs over $300 (timeout: no PO sent) |
+| Menu | `stock.low`, `lot.expiring`, quarantine, stock-out | "86 salmon after 4 more", specials that use at-risk stock (margin and allergens checked), last-N flags online | recipes, remaining_portions, margin_calc, allergen_check, dishes_using | Every 86 and every special (timeout: no special; an 86 with no stock left auto-approves) |
+
+The coordinator resolves conflicts between agents. Example: the Menu agent wants a salmon special while salmon is short and Procurement has
+nothing arriving before Friday. The coordinator blocks the special and says why.
 
 ## Repo layout
 
 ```
 restaurant_ops/
-  config.py            settings (env / .env)
-  db/                  schema.sql, connection helpers
-  data/                catalog, synthetic generator, seed CLI
-  core/                forecasting, inventory, optimizer, constraints, menu, prep
-  tools/               registry (LangChain tools) and FastAPI app
-  agents/              llm, state, prompts, 5 agents, mock policies, supervisor, decision log
-  sim/                 simulator, disruptions, vendors, baseline, metrics, run CLI
-ui/app.py              Streamlit app (components.py: helpers)
-tests/                 pytest (constraints)
-DESIGN.md              contracts between modules + per-phase build notes
-Idea.md                product intent and demo plan
+  config.py              settings (env / .env)
+  db/                    schema.sql (+ service_runs, event_log, quote_log), connection helpers
+  data/                  catalog (20 dishes, 60 ingredients, 4 stations, 4 suppliers), synthetic generator, seed CLI
+  core/                  forecasting, inventory, optimizer, constraints (incl. live action types), menu, prep
+  tools/                 registry (LangChain tools) and the tools FastAPI app
+  agents/                batch planning graph (supervisor), LLM access, decision log, mock policies
+  live/                  the real-time service
+    events.py bus.py clock.py        event types, Redis Streams / in-process bus, service clock
+    kitchen.py stock.py intraday.py  kitchen-load + ETA model, live FEFO stock, intraday forecast
+    floor.py guests.py online.py     dining floor, guest + online demand simulator, online orders
+    menu_live.py metrics.py          tonight's menu state, KPIs
+    agents/                          order, inventory, forecasting, procurement, menu (+ shared base, LLM review)
+    coordinator.py                   LangGraph check -> interrupt -> verify -> execute
+    scenarios.py service.py          disruptions; the orchestrator
+    server.py run.py replay.py       FastAPI + WebSocket, headless runner, replay
+  sim/                   day-by-day batch simulator + fixed-par baseline (the "agents vs baseline" slide)
+frontend/                React (Vite): floor plan, online order page, manager dashboard; one WebSocket store
+tests/                   pytest
 ```
 
 ## Setup
 
 ```bash
 uv sync
-cp .env.example .env     # then edit
 ```
 
-LLM configuration (`.env`):
+```bash
+cd frontend && npm install && npm run build && cd ..
+```
+
+`.env` is optional (`cp .env.example .env`). Without an LLM API key the agents run in mock mode (rule-based) and
+the whole demo works offline. LLM settings:
 
 | Variable | Meaning |
 | --- | --- |
-| `LLM_MODE` | `live` (LLM agents) or `mock` (rule-based policies, no API key). Empty = `live` if the selected provider's API key is set, else `mock`. |
-| `LLM_PROVIDER` | `meta` (default), `openai`, `anthropic` or `ollama`. |
-| `META_API_KEY` (or `MODEL_API_KEY`), `META_BASE_URL`, `META_MODEL`, `META_REASONING_EFFORT` | Meta Model API via its OpenAI-compatible endpoint. Defaults: `https://api.meta.ai/v1`, `muse-spark-1.3`, API-default reasoning effort. |
-| `OPENAI_API_KEY`, `OPENAI_MODEL`, `OPENAI_BASE_URL` | OpenAI. Default model `gpt-4.1`. |
-| `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL` | Anthropic. Default model `claude-sonnet-5-5`. |
-| `OLLAMA_MODEL` | Local Ollama model, no key. |
-| `LLM_MODEL` | Optional override: a bare model name for the selected provider, or `provider:model` (e.g. `openai:gpt-4.1`). Swapping needs no code change. |
-| `LANGSMITH_*` | Optional tracing. |
+| `LLM_MODE` | `live` (LLM reviews Menu / Procurement / Forecasting proposals) or `mock`. Empty = `live` if the provider's API key is set. |
+| `LLM_PROVIDER`, `LLM_MODEL` | `meta` (default), `openai`, `anthropic` or `ollama`; `LLM_MODEL` may be `provider:model`. |
+| `*_API_KEY`, `*_MODEL`, `*_BASE_URL` | Per-provider settings (see `.env.example`). |
+| `EVENT_BUS` | `auto` (Redis Streams if `REDIS_URL` answers, else in-process), `redis`, or `memory`. |
+| `REDIS_URL` | Default `redis://localhost:6379/0`. |
+| `LIVE_PO_APPROVAL_THRESHOLD`, `LIVE_DISCARD_APPROVAL_VALUE`, `APPROVAL_TIMEOUT_S` | Approval policy for the live service (defaults $300, $50, 120 s). |
 
-Mock mode is the safe default for a demo without network access: the same graph, constraints, approvals and trace run,
-but the agents' judgment is replaced by plain-code policies.
+Redis is optional. To use Redis Streams, start a server before the backend:
+
+```bash
+redis-server --daemonize yes
+```
 
 ## How to run
 
-Run in this order from the repo root.
+1. Seed the world (12 months of synthetic history, suppliers, opening lots). The first forecast trains the models:
+   ```bash
+   uv run python -m restaurant_ops.data.seed --force
+   ```
+2. Start the live service (backend + UI on http://127.0.0.1:8000):
+   ```bash
+   uv run python -m restaurant_ops.live.server
+   ```
+   A dinner service starts right away at 10x. Use the clock buttons for pause, 1x, 10x or 60x. **New service**
+   starts a fresh seeded dinner. The disruption buttons inject a party of 12, salmon short, cooler failure,
+   heatwave or forecast miss. Click a table to place an order by hand. **Online page ↗** opens the customer page
+   (`/#/online`). **Replay…** plays back any logged service from its event log.
 
-1. Seed the database (12 months of synthetic history, suppliers, opening lots):
+   For frontend development, run `npm run dev` in `frontend/` (port 5173, proxied to the backend).
+3. Headless, seeded run (no browser), e.g. the salmon-short demo:
    ```bash
-   uv run python -m restaurant_ops.data.seed            # add --force to rebuild, --sim-start YYYY-MM-DD to pick the day
+   uv run python -m restaurant_ops.live.run --scenario salmon_short@18:45 --scenario party_of_12@19:15 --policy demo
    ```
-   The simulation starts **today** (any weekday) and the 365 days of history end yesterday. Override with
-   `--sim-start` or `SIM_START=YYYY-MM-DD` in `.env`. The date is stored in the DB (`meta.sim_start`) and every later
-   run uses it. Reseeding deletes `data/models/forecast_models.pkl` so the models retrain on the new data.
-2. Forecast models train lazily on first use (and are pickled to `data/models/`); nothing to do. To force a retrain:
+   Policies: `demo` (approve, but reject an ingredient's first emergency PO as over budget), `approve`, `reject`,
+   `timeout` (nobody answers: safe defaults apply).
+4. Replay a logged service from the command line:
    ```bash
-   uv run python -m restaurant_ops.core.forecasting            # optional: --max-memory-mb 2048
+   uv run python -m restaurant_ops.live.replay
    ```
-   Training is CPU-only (LightGBM, `n_jobs=1`) and aborts with `TrainingMemoryError` if process memory passes
-   `TRAIN_MAX_MEMORY_MB` (default 4096). Restart Streamlit afterwards: it keeps the old models in memory.
-3. CLI simulation (agent and baseline on identical worlds, then a KPI table):
+5. Agents vs fixed-par baseline over a week (batch simulator; feeds the baseline panel on the dashboard):
    ```bash
-   uv run python -m restaurant_ops.sim.run --days 7 --policy both --scenario salmon_shortfall --auto-approve
-   ```
-   Drop `--auto-approve` to be asked in the terminal. Scenarios: `salmon_shortfall`, `private_booking`,
-   `cooler_failure`, `heatwave`, `all`, `none`.
-4. Streamlit UI:
-   ```bash
-   uv run streamlit run ui/app.py
-   ```
-   Pick policy / scenario / days in the sidebar, then **Start**, **Step day** or **Run to end**. With auto-approve off,
-   a run pauses when the chef must decide; the sidebar and tab title flag it and the **Approvals** tab holds the cards.
-   Tabs: Run, Agent trace, Approvals, Forecast, KPIs. **Load past run** (top of the sidebar) opens any run saved in
-   `data/runs/` read-only; Start always uses a fresh run id, so a saved run is never overwritten.
-5. Tools API (optional; same functions the agents call):
-   ```bash
-   uv run uvicorn restaurant_ops.tools.api:app
+   uv run python -m restaurant_ops.sim.run --days 7 --policy both --scenario all --auto-approve
    ```
 6. Tests:
    ```bash
    uv run pytest
    ```
 
-## Scenario timeline (day 1 = the seeded start date, any weekday)
+## Online ready-time quotes
 
-| Day | Disruption |
+The quote comes from a deterministic kitchen-load model (`live/kitchen.py`). Each item has a station; the order is
+ready when its slowest item is done:
+
+    T_ready = t_now + max_i (W_s(i) + P_i) + B
+
+`W` is the current wait at that station (queued minutes ÷ cook slots), `P` is the item's calibrated cook time and
+`B` is a 3-minute packing buffer. The page shows a P50–P90 range. P90 inflates waits and cook times by the 90th
+percentile of observed actual/estimated ratios. Every finished item recalibrates its station (EWMA), and every
+online order logs quoted vs actual (`quote_log`), which gives the quote-accuracy KPI.
+
+Busyness is calm, busy or slammed. It comes from station utilisation plus the covers the Forecasting agent expects
+in the next 30 minutes. When the kitchen stays slammed, the Order agent asks to switch online ordering to quick
+items only or pause it. 86'd dishes disappear from the online page at once, and "last 4" dishes are limited to
+one per order.
+
+## Disruption scenarios
+
+| Button | What happens |
 | --- | --- |
-| 3 | Cooler failure: all dairy lots discarded (`cooler_failure`) |
-| 3 | Heatwave notice: 34 C on days 4-6, cold dishes up (`heatwave`) |
-| 4 | Salmon supplier will fill only 30% of day 5's delivery (`salmon_shortfall`) |
-| 4 | 40-cover private dinner booked for day 6 (`private_booking`) |
+| Party of 12 | A walk-in party of 12 pre-orders (mostly grill). The grill wait jumps, online quotes stretch and customers are notified. The Order agent asks to throttle online orders. |
+| Salmon short | FreshCatch fills only 30% and 6 salmon portions are left. Inventory publishes stock.low. Menu proposes "86 salmon after 4 more" and a replacement special. Procurement drafts a fallback PO (over the threshold) and re-plans after a rejection with a reason. |
+| Cooler fails | Dairy lots are quarantined at once. Inventory requests a discard, and Menu 86s the dishes left with no usable dairy. |
+| Heatwave | 34 °C for 3 days. The forecast shifts the dish mix toward cold dishes and stock is re-checked against it. |
+| Forecast miss | Walk-ins run about 75% above the model, so covers end well over forecast. The Forecasting agent revises, adjusts tomorrow, and Procurement re-checks tomorrow's order. |
 
-`disruptions.describe(name)` prints these with the real dates and weekdays. The demo window also gets a home game on
-each Wednesday and Saturday it contains. Agents see the date with its weekday plus the coming week (weekends marked),
-and the date-based tools (forecast, events, reservations, weather) return a `weekday` field.
+## 3-minute demo script
 
-Disruptions land after the morning plan of their day and trigger an event cycle for the agents.
+Run the dinner at 60x with the floor on the left and the dashboard on the right.
+
+1. **0:00–0:20, the problem.** The factors interact: 3 meal periods × 7 days × 3 month periods × 4 seasons ×
+   4 event types × 3 risk levels = 3,024 combinations before staffing, suppliers or dishes. Rules can't keep up
+   during service.
+2. **0:20–1:00, service starts.** Tables fill. Click a table and order "Pan-Seared Salmon" with mods "no dairy, nut
+   allergy". The result shows it routed to sauté, with butter and cream left out, in under a millisecond. The
+   decision feed updates.
+3. **1:00–1:30, online order.** Open the online order page. Add a ribeye and see "ready 19:25–19:35". Press
+   **Party of 12**. The grill load jumps, the quote moves out live, and the Order agent asks to limit online orders
+   to quick items. Approve it.
+4. **1:30–2:20, disruption.** Press **Salmon short**. Inventory flags 6 portions left, Menu proposes "86 Pan-Seared
+   Salmon after 4 more" plus a special, and Procurement drafts a fallback PO over the threshold. Approve the special
+   and the 86. Reject the PO with a reason ("over budget, wait for FreshCatch"). Procurement re-plans a smaller,
+   cheaper order, or holds and says why.
+5. **2:20–3:00, results.** Show the service KPIs (latency, quote accuracy, ticket times, 86s caught, waste, food cost,
+   auto vs approval). Then replay the decision log with **Replay…**.
+
+Tip: record a backup video of a seeded run. A headless run with the same seed and the same manager policy
+reproduces exactly.
 
 ## KPIs
 
 | Metric | What it shows |
 | --- | --- |
-| Waste ($ and %) | Perishability handling |
-| Stockouts / 86's | Forecast and replenishment quality |
-| Food cost % | Purchasing decisions |
-| Forecast error (MAPE, P90 coverage) | Model quality |
-| Human approvals needed | Autonomy with oversight |
+| Order-to-station latency (p50/p95/max ms) | Real-time behaviour |
+| Ready-time quote accuracy (% within quoted range), MAE | Kitchen-load model and online experience |
+| Ticket times and late tickets | Kitchen pacing |
+| Stockouts, and 86s caught before a guest ordered | Inventory and Menu agents |
+| Waste $ and food cost % | Perishability and procurement decisions |
+| Forecast error (tonight vs model P50; P10–P90 coverage) | Forecasting agent |
+| Decisions auto-executed vs sent for approval | Autonomy with oversight |
 
-## 3-minute demo script
+## Known limitations
 
-1. **0:00-0:30, the problem.** Restaurants waste 4-10% of food purchases (verify the figure before using it); the drivers
-   interact in ways rules cannot cover: 3 meal periods x 7 days x 3 month periods x 4 seasons x 4 event types x
-   3 risk levels = 3,024 combinations before staffing, suppliers or dishes.
-2. **0:30-1:15, normal Monday.** Forecast tab with bands, the signal report ("payday matters here, start of month
-   doesn't"), orders placed, prep lists out.
-3. **1:15-2:15, Thursday disruption.** The salmon supplier is short. In the Agent trace: Purchasing finds a fallback at
-   about +12% cost, the Menu Agent swaps a special to use at-risk cod, the Prep Planner re-plans, and the chef approves
-   on screen in the Approvals tab.
-4. **2:15-3:00, results.** KPIs tab: agents vs fixed-par baseline across the week.
-
-Tip: record a backup video of a seeded run; the simulator is deterministic for a given seed.
-
-## Known limitations / untested
-
-- **This code was built without being executed.** Only `py_compile` checks were run: no tests, no seed, no simulation,
-  no UI session. Expect a first smoke run to turn up bugs; start with the seed, then `--days 1 --policy agent
-  --scenario none`, then the full CLI run, then the UI.
-- Live LLM agents (LangGraph `create_react_agent`, structured output) have never been exercised; mock mode is the
-  most likely path to work first.
-- The "+12% fallback" and other demo numbers in the script depend on the seeded world and are not guaranteed.
-- The Streamlit app cannot switch tabs programmatically; it shows a banner, a sidebar alert and a flagged tab title
-  when approval is needed.
-- Synthetic data only; the 4-10% waste statistic in the pitch is unverified.
+- Synthetic data only. Prices, demand and the demo numbers come from the seeded world and are not real-world
+  figures.
+- Live LLM mode has not been exercised against a real provider in this repo's tests. Mock mode is what the tests
+  and the demo run.
+- The approval timeout counts wall seconds while the clock runs. At 60x, 120 s of real time is two hours of service.
+  Pause the clock to discuss a decision.
+- One service runs at a time per backend process. Each service gets its own DB copy under `data/live/`.

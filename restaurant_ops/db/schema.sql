@@ -233,3 +233,43 @@ CREATE INDEX IF NOT EXISTS idx_stock_ing ON stock_counts(ingredient_id, date);
 CREATE INDEX IF NOT EXISTS idx_waste_date ON waste_log(date);
 CREATE INDEX IF NOT EXISTS idx_decisions_run ON decisions(run_id, sim_date);
 CREATE INDEX IF NOT EXISTS idx_trace_run ON trace(run_id, id);
+
+-- ---------------------------------------------------------------------------------------------------------
+-- Real-time service (restaurant_ops/live). One row per live dinner service; its DB is a copy of the seeded DB.
+CREATE TABLE IF NOT EXISTS service_runs (
+    service_id TEXT PRIMARY KEY,
+    service_date DATE NOT NULL,
+    meal_period TEXT NOT NULL,
+    seed INTEGER NOT NULL,
+    started_ts TEXT NOT NULL,
+    bus TEXT,
+    llm_mode TEXT,
+    status TEXT NOT NULL DEFAULT 'running'
+);
+
+-- Append-only log of every event and decision on the bus; the whole service can be replayed from it.
+CREATE TABLE IF NOT EXISTS event_log (
+    service_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    wall_ts TEXT NOT NULL,
+    sim_ts TEXT NOT NULL,
+    type TEXT NOT NULL,
+    source TEXT NOT NULL,
+    payload JSON,
+    PRIMARY KEY (service_id, seq)
+);
+
+-- Online ready-time quotes vs actuals (quote accuracy KPI and prep-time recalibration).
+CREATE TABLE IF NOT EXISTS quote_log (
+    service_id TEXT NOT NULL,
+    order_id TEXT NOT NULL,
+    placed_sim_ts TEXT NOT NULL,
+    quoted_p50 TEXT NOT NULL,
+    quoted_p90 TEXT NOT NULL,
+    actual_ready TEXT,
+    within_range INTEGER,
+    error_min REAL,
+    PRIMARY KEY (service_id, order_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_event_log_type ON event_log(service_id, type);

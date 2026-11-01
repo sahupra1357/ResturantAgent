@@ -343,7 +343,7 @@ def _reservation_rows(d: date, period: str, organic_covers: float, rng: np.rando
 
 
 def _staffing_rows(d: date, events: Sequence[Mapping]) -> list[tuple]:
-    """Staff per station: default roster, +1 on grill/saute when busy, +1 fry on game nights."""
+    """Staff per station: default roster, +1 on grill/saute when busy, +1 saute (fryer) on game nights."""
     rows = []
     for p in PERIODS:
         busy = expected_covers(d, p, events=events) > 1.15 * BASE_COVERS[p]
@@ -351,7 +351,7 @@ def _staffing_rows(d: date, events: Sequence[Mapping]) -> list[tuple]:
             n = cat.DEFAULT_STAFFING[s][p]
             if busy and s in ("grill", "saute") and p != "late":
                 n += 1
-            if has_home_game(events) and s == "fry" and p in ("dinner", "late"):
+            if has_home_game(events) and s == "saute" and p in ("dinner", "late"):
                 n += 1
             rows.append((d.isoformat(), p, s, n))
     return rows

@@ -31,7 +31,7 @@ class Dish:
     name: str
     category: str  # starter|main|dessert|side
     price: float
-    station: str  # grill|saute|fry|garde_manger|pastry
+    station: str  # grill|saute|cold|pastry
     is_cold: bool
     prep_minutes: float  # active labour minutes per portion
     recipe: dict[str, float]  # ingredient_id -> qty per portion (ingredient units)
@@ -144,23 +144,23 @@ INGREDIENTS_BY_ID: dict[str, Ingredient] = {i.id: i for i in INGREDIENTS}
 
 DISHES: list[Dish] = [
     # --- starters
-    Dish("caesar_salad", "Caesar Salad", "starter", 13.0, "garde_manger", True, 2.5,
+    Dish("caesar_salad", "Caesar Salad", "starter", 13.0, "cold", True, 2.5,
          {"romaine": 0.12, "parmesan": 0.025, "eggs": 1, "baguette": 0.15, "olive_oil": 0.02, "lemon": 0.03},
          popularity=7),
-    Dish("gazpacho", "Chilled Gazpacho", "starter", 11.0, "garde_manger", True, 2.0,
+    Dish("gazpacho", "Chilled Gazpacho", "starter", 11.0, "cold", True, 2.0,
          {"tomato": 0.25, "cucumber": 0.10, "bell_pepper": 0.08, "onion": 0.03, "garlic": 0.01,
           "olive_oil": 0.02, "baguette": 0.10},
          seasonal_months=(5, 6, 7, 8, 9), popularity=4),
-    Dish("sea_bass_ceviche", "Sea Bass Ceviche", "starter", 17.0, "garde_manger", True, 3.0,
+    Dish("sea_bass_ceviche", "Sea Bass Ceviche", "starter", 17.0, "cold", True, 3.0,
          {"sea_bass": 0.12, "lime": 0.05, "onion": 0.03, "avocado": 0.08, "cherry_tomato": 0.05},
          popularity=4),
-    Dish("goat_cheese_salad", "Goat Cheese & Arugula Salad", "starter", 14.0, "garde_manger", True, 2.5,
+    Dish("goat_cheese_salad", "Goat Cheese & Arugula Salad", "starter", 14.0, "cold", True, 2.5,
          {"goat_cheese": 0.05, "arugula": 0.06, "cherry_tomato": 0.06, "balsamic": 0.015, "olive_oil": 0.015},
          popularity=4),
-    Dish("crispy_calamari", "Crispy Calamari", "starter", 15.0, "fry", False, 1.5,
+    Dish("crispy_calamari", "Crispy Calamari", "starter", 15.0, "saute", False, 1.5,
          {"calamari": 0.15, "flour": 0.03, "frying_oil": 0.08, "lemon": 0.03},
          popularity=7, tags=("fried", "shareable")),
-    Dish("bbq_wings", "BBQ Chicken Wings", "starter", 14.0, "fry", False, 1.5,
+    Dish("bbq_wings", "BBQ Chicken Wings", "starter", 14.0, "saute", False, 1.5,
          {"chicken_wings": 0.35, "frying_oil": 0.08, "bbq_sauce": 0.04, "butter": 0.01},
          popularity=6, tags=("fried", "shareable")),
     Dish("pumpkin_soup", "Roasted Pumpkin Soup", "starter", 10.0, "saute", False, 2.0,
@@ -198,7 +198,7 @@ DISHES: list[Dish] = [
           "cherry_tomato": 0.05, "parsley": 0.005},
          popularity=4),
     # --- sides
-    Dish("parmesan_fries", "Parmesan Truffle Fries", "side", 9.0, "fry", False, 1.0,
+    Dish("parmesan_fries", "Parmesan Truffle Fries", "side", 9.0, "saute", False, 1.0,
          {"frozen_fries": 0.25, "frying_oil": 0.05, "parmesan": 0.02, "parsley": 0.003},
          popularity=9, tags=("fried", "shareable")),
     Dish("grilled_vegetables", "Grilled Summer Vegetables", "side", 10.0, "grill", False, 3.0,
@@ -217,16 +217,16 @@ DISHES_BY_ID: dict[str, Dish] = {d.id: d for d in DISHES}
 
 # --------------------------------------------------------------------------- stations & staffing
 
-STATIONS: list[str] = ["grill", "saute", "fry", "garde_manger", "pastry"]
+# Four kitchen stations; fried dishes are cooked on saute (fryer sits on that line), cold = garde manger.
+STATIONS: list[str] = ["grill", "saute", "cold", "pastry"]
 MEAL_PERIOD_MINUTES: dict[str, int] = {"lunch": 180, "dinner": 240, "late": 150}
 STAFF_EFFICIENCY = 0.8  # share of a shift that is productive prep/cook time
 
 # Default staff per station per meal period
 DEFAULT_STAFFING: dict[str, dict[str, int]] = {
     "grill": {"lunch": 1, "dinner": 2, "late": 1},
-    "saute": {"lunch": 2, "dinner": 3, "late": 1},
-    "fry": {"lunch": 1, "dinner": 2, "late": 1},
-    "garde_manger": {"lunch": 2, "dinner": 2, "late": 1},
+    "saute": {"lunch": 3, "dinner": 4, "late": 2},
+    "cold": {"lunch": 2, "dinner": 2, "late": 1},
     "pastry": {"lunch": 1, "dinner": 1, "late": 1},
 }
 

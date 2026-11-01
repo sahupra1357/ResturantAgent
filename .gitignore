@@ -10,3 +10,4 @@ __pycache__/
 .gstack/
 data/runs/
 .DS_Store
+data/live/
