@@ -15,15 +15,14 @@ dependencies = [
     "lightgbm>=4.7.0",
     "numpy>=2.5.4",
     "pandas>=3.1.0",
-    "plotly>=7.1.0",
     "psutil>=7.2.2",
     "pulp>=4.2.0",
     "pydantic>=2.14.1",
     "pydantic-settings>=2.16.1",
     "pytest>=9.2.0",
     "python-dotenv>=1.2.4",
+    "redis>=5.0.0",
     "scikit-learn>=1.9.1",
-    "streamlit>=1.66.1",
     "uvicorn>=0.54.0",
 ]
 

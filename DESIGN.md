@@ -55,8 +55,8 @@ ResturantAgent/
       baseline.py           # fixed-par policy with same interfaces
       metrics.py            # KPIs: waste $/%, stockouts/86s, food cost %, MAPE, P90 coverage, approvals
       run.py                # CLI: `python -m restaurant_ops.sim.run --days 7 --policy agent|baseline|both`
-  ui/
-    app.py                  # Streamlit: trace timeline, approval queue, KPIs, forecast & signals
+  live/                     # real-time service (see "Real-time layer" below)
+  frontend/                 # React UI: floor, online order page, manager dashboard
   tests/
     test_constraints.py     # written, not run during build
 ```
@@ -69,7 +69,7 @@ ResturantAgent/
 - Demo week = SIM_START .. SIM_START+6. Calendar in that week: 2 home games (Wed dinner,
   Sat dinner), private dinner for 40 (added by disruption 2 on Saturday), payday = 15th and
   last day of month (also within history).
-- Stations: `grill`, `saute`, `fry`, `garde_manger` (cold), `pastry`. Each has capacity in
+- Stations: `grill`, `saute` (incl. the fryer), `cold` (garde manger), `pastry`. Each has capacity in
   prep-minutes per meal period and staff per shift.
 
 ## Database schema (SQLite, `data/restaurant.db`)
@@ -235,7 +235,7 @@ Disruptions (`disruptions.py`), each `{"kind", "day_offset", "params"}`:
 `baseline.py`: fixed par levels (par = mean daily usage × (lead time + 2)), order-up-to every
 morning from the cheapest supplier, no specials, no re-planning.
 
-## UI (Streamlit)
+## UI (Streamlit; removed, replaced by the React app in frontend/ - kept for history)
 
 Tabs: **Run** (pick policy/scenario, step a day), **Agent trace** (timeline from `trace`),
 **Approvals** (pending interrupt items → approve/reject with note → resume graph),
@@ -334,3 +334,48 @@ Added `ui/app.py`, `ui/components.py`, `README.md`. Nothing was run; only `py_co
 - Meta and OpenAI use `ChatOpenAI` (`langchain-openai`), with structured output forced to `function_calling`,
   because `AgentReport.payload` is a free-form dict that strict `json_schema` mode rejects. OpenAI reasoning models
   (o-series, gpt-5*) are created without `temperature`.
+
+
+## Real-time layer (restaurant_ops/live)
+
+The batch graph above plans a day. The live layer runs a dinner service minute by minute on one event bus.
+
+### Event contract
+
+Every event is `{seq, type, source, sim_ts, wall_ts, payload}` and is appended to `event_log` before dispatch.
+Types (live/events.py): `order.submitted`, `order.created`, `item.fired`, `item.done`, `item.held`, `stock.low`,
+`stock.out`, `lot.expiring`, `lot.quarantined`, `inventory.snapshot`, `supplier.shortfall`, `po.sent`,
+`forecast.updated`, `forecast.miss`, `weather.alert`, `menu.updated`, `kitchen.load`, `quote.updated`,
+`online.order`, `online.mode`, `table.updated`, `party.arrived`, `party.left`, `decision.proposed`,
+`decision.resolved`, `service.started` (carries the full initial snapshot), `service.ended`, `clock.tick`,
+`kpi.updated`, `scenario.injected`, `agent.log`.
+
+State-bearing events carry snapshots (tables, kitchen load, inventory, menu, online orders, decisions, KPIs), so
+`replay.fold(events)` and the UI reducer (`frontend/src/store.js`) rebuild the service from the log alone.
+
+### Bus
+
+`live/bus.py`. `RedisStreamsBus` XADDs to `ro:events:{service_id}` and XREADs back in order. `InProcessBus` uses
+a deque. `make_bus` picks Redis when `EVENT_BUS=auto` and Redis answers. Dispatch is synchronous and non-recursive:
+events published by handlers are queued behind the current one. A failing subscriber is logged in `bus.errors` and
+does not stop the others.
+
+### Decisions
+
+A proposal is `{agent, action_type, payload, title, reason, trace, tools, confidence, key, timeout_default}`. The
+coordinator dedupes by `key`: a duplicate while one is pending is merged, and one resolved within 20 sim minutes
+is suppressed unless `force` is set. Then it runs a LangGraph per decision: `check` (core/constraints.py + conflict
+rules) -> `approval` (`interrupt()`, resumed with `{approved, note, payload?}`) -> `verify` -> `execute`. New
+action types checked by core/constraints.py: `discard_lots`, `throttle_online`, `allergen_swap` (a replacement may
+never contain a declared allergen), and `comp`.
+
+Live approval policy: specials, 86s, allergen swaps and comps always need the manager. POs need approval above
+`LIVE_PO_APPROVAL_THRESHOLD`, discards above `LIVE_DISCARD_APPROVAL_VALUE`, and throttles whenever the mode is not
+`open`. A timeout after `APPROVAL_TIMEOUT_S` wall seconds (while the clock runs) resolves the decision with
+`timeout_default`.
+
+### Time
+
+`ServiceClock` runs the dinner from 17:00 to 22:30 at 0/1/10/60x. `Service.advance(wall_dt)` steps in at most
+15 sim seconds. The kitchen computes exact start and done times inside a step, so the step size does not change
+results. A headless run (`run_headless`) uses the same code without sleeping.

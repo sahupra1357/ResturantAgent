@@ -15,6 +15,10 @@ An action is {"action_type", "payload", "rationale"?, "agent"?, "est_cost"?}. Pa
   discard_lot          {lot_id, reason ('expired'|'spoilage'|'discarded'), qty?}
   adjust_forecast      {date, meal_period ('lunch'|'dinner'|'late'|'all'), factor (0.5..1.6), reason}
   flag_variance        {ingredient_id, variance_pct?, flag? ('shrinkage'|'over_portioning'|...)}
+  discard_lots         {lots:[{lot_id, reason, qty?}]}  (several discard_lot checks in one decision)
+  throttle_online      {mode ('open'|'quick_only'|'paused'), reason}
+  allergen_swap        {order_id, item_id, from_dish, to_dish (null = drop the item), guest_allergens:[str]}
+  comp                 {order_id, amount, order_total, reason}
 
 Rules (code -> severity): positive_quantities, supplier_carries_item, lead_time, min_order_value,
 budget_daily, budget_weekly, shelf_life, fefo, stock_available, allergen_undeclared, station_capacity
@@ -33,7 +37,10 @@ from restaurant_ops.core import inventory, menu, prep
 from restaurant_ops.core.util import to_date
 
 ACTION_TYPES = ("adjust_forecast", "place_po", "reschedule_po", "substitute_supplier", "add_special",
-                "86_dish", "substitute_ingredient", "prep_list", "discard_lot", "flag_variance")
+                "86_dish", "substitute_ingredient", "prep_list", "discard_lot", "flag_variance",
+                "discard_lots", "throttle_online", "allergen_swap", "comp")
+ONLINE_MODES = ("open", "quick_only", "paused")
+MAX_COMP_SHARE = 0.5  # a comp may not exceed half the order total
 FORECAST_FACTOR_RANGE = (0.5, 1.6)
 DAILY_CEILING_FACTOR = 2.0  # daily PO spend ceiling = DAILY_BUDGET x this (a morning order covers ~2 days)
 WEEKLY_DAYS = 7  # weekly ceiling = DAILY_BUDGET x 7
@@ -456,11 +463,63 @@ def _check_flag_variance(a, p, conn, as_of, out):
         out.append(Violation("variance_not_supported", "stock counts do not show a persistent variance for this ingredient", "warn"))
 
 
+def _check_discard_lots(a, p, conn, as_of, out):
+    lots = p.get("lots")
+    if not lots:
+        out.append(Violation("missing_field", "payload is missing: lots"))
+        return
+    for lot in lots:
+        _check_discard_lot(a, lot if isinstance(lot, dict) else {"lot_id": lot}, conn, as_of, out)
+
+
+# =========================================================================== live service actions
+
+
+def _check_throttle_online(a, p, conn, as_of, out):
+    if _missing(p, ["mode"], out):
+        return
+    if p["mode"] not in ONLINE_MODES:
+        out.append(Violation("invalid_mode", f"online mode must be one of {', '.join(ONLINE_MODES)}"))
+    if p["mode"] != "open" and not str(p.get("reason", "")).strip():
+        out.append(Violation("missing_reason", "throttling online orders needs a written reason"))
+
+
+def _check_allergen_swap(a, p, conn, as_of, out):
+    """The allergen guard: a replacement dish may never contain an allergen the guest declared."""
+    if _missing(p, ["order_id", "item_id", "from_dish"], out):
+        return
+    guest = {str(x).lower() for x in (p.get("guest_allergens") or [])}
+    to = p.get("to_dish")
+    if not to:
+        return  # dropping the item is always allowed
+    d = _dish(conn, to)
+    if d is None:
+        out.append(Violation("unknown_dish", f"dish {to} does not exist"))
+        return
+    clash = sorted(menu.dish_allergen_set(conn, to) & guest)
+    if clash:
+        out.append(Violation("allergen_conflict", f"{d['name']} contains {', '.join(clash)}, which the guest cannot eat"))
+    if menu.feasible_portions(to, as_of.isoformat(), conn) < 1:
+        out.append(Violation("stock_available", f"no stock for {d['name']}"))
+
+
+def _check_comp(a, p, conn, as_of, out):
+    if _missing(p, ["order_id", "amount"], out):
+        return
+    amt, tot = _num(p["amount"]), _num(p.get("order_total"))
+    if amt is None or amt <= 0:
+        out.append(Violation("positive_quantities", "comp amount must be > 0"))
+    elif tot is not None and amt > tot * MAX_COMP_SHARE + 1e-9:
+        out.append(Violation("comp_too_large", f"comp {amt:.2f} exceeds {MAX_COMP_SHARE:.0%} of the order total {tot:.2f}"))
+
+
 _CHECKS = {
     "place_po": _check_place_po, "reschedule_po": _check_reschedule_po,
     "substitute_supplier": _check_substitute_supplier, "add_special": _check_add_special,
     "86_dish": _check_86, "substitute_ingredient": _check_substitute_ingredient, "prep_list": _check_prep_list,
     "discard_lot": _check_discard_lot, "adjust_forecast": _check_adjust_forecast, "flag_variance": _check_flag_variance,
+    "discard_lots": _check_discard_lots, "throttle_online": _check_throttle_online,
+    "allergen_swap": _check_allergen_swap, "comp": _check_comp,
 }
 
 

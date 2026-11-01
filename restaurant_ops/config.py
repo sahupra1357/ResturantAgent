@@ -38,7 +38,7 @@ class Settings(BaseSettings):
     SEATS: int = 80
     MEAL_PERIODS: list[str] = ["lunch", "dinner", "late"]
     SEAT_TURNS: dict[str, float] = {"lunch": 1.5, "dinner": 2.0, "late": 0.6}
-    STATIONS: list[str] = ["grill", "saute", "fry", "garde_manger", "pastry"]
+    STATIONS: list[str] = ["grill", "saute", "cold", "pastry"]
     PAYDAY_DAYS: list[int] = [15, -1]  # day of month; -1 = last day of month
 
     # --- thresholds ---
@@ -47,6 +47,17 @@ class Settings(BaseSettings):
     MAX_AGENT_STEPS: int = 8
     MAX_SUPERVISOR_STEPS: int = 3
     TRAIN_MAX_MEMORY_MB: int = 4096  # forecast training aborts when process RSS exceeds this; 0 = no limit
+
+    # --- real-time service (restaurant_ops/live) ---
+    EVENT_BUS: str = "auto"  # "auto" (Redis Streams if reachable, else in-process) | "redis" | "memory"
+    REDIS_URL: str = "redis://localhost:6379/0"
+    LIVE_DIR: Path = PROJECT_ROOT / "data" / "live"
+    LIVE_PERIOD: str = "dinner"  # meal period a live service runs
+    LIVE_PO_APPROVAL_THRESHOLD: float = 300.0  # unplanned in-service POs above this need the manager
+    LIVE_DISCARD_APPROVAL_VALUE: float = 50.0  # discards worth more than this need the manager
+    APPROVAL_TIMEOUT_S: float = 120.0  # wall seconds (while the clock runs) before the safe default applies
+    LIVE_HOST: str = "127.0.0.1"
+    LIVE_PORT: int = 8000
 
     # --- LLM ---
     LLM_MODE: str = ""  # "live" | "mock"; empty -> live if the chosen provider has an API key
