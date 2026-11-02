@@ -8,13 +8,14 @@ from __future__ import annotations
 
 from datetime import timedelta
 
+from restaurant_ops.config import settings
 from restaurant_ops.live import events as E
 from restaurant_ops.live.agents.base import LiveAgent
 from restaurant_ops.tools import registry as R
 
 REVISE_EVERY_MIN = 15
-MISS_PCT = 15.0
-MISS_Z = 1.5        # the miss must also be statistically clear: arrivals are lumpy (parties of 1-6)
+# FORECAST_MISS_PCT / FORECAST_MISS_Z in config.Settings: the miss must be large AND statistically clear
+# (arrivals are lumpy: parties of 1-6)
 PERSISTENCE = 0.5  # share of tonight's miss carried into tomorrow's adjustment
 
 
@@ -51,7 +52,7 @@ class ForecastingAgent(LiveAgent):
         miss = rev["miss_pct"]
         reason = (f"{rev['seated']} covers arrived vs {rev['expected_so_far']:.0f} expected by {svc.clock.hhmm()}; "
                   f"tonight now {rev['p10']:.0f}-{rev['p90']:.0f} (P50 {rev['p50']:.0f}, {miss:+.0f}% vs model)")
-        big = (abs(miss) >= MISS_PCT and abs(rev["z"]) >= MISS_Z
+        big = (abs(miss) >= settings.FORECAST_MISS_PCT and abs(rev["z"]) >= settings.FORECAST_MISS_Z
                and (self.escalated_at is None or abs(miss) >= abs(self.escalated_at) + 10))
         self.publish(reason, recheck=big)
         if big:

@@ -271,18 +271,21 @@ def test_server_api_and_websocket():
 
     from restaurant_ops.live import server
 
+    from restaurant_ops.config import settings
+
+    mgr = {"Authorization": f"Bearer {settings.MANAGER_TOKEN}"}
     with TestClient(server.app) as c:
         st = c.get("/api/state").json()
         assert len(st["tables"]) == 28 and st["service"]["status"] == "running"
-        assert c.post("/api/clock", json={"speed": 0}).json()["speed"] == 0
+        assert c.post("/api/clock", json={"speed": 0}, headers=mgr).json()["speed"] == 0
         free = next(t for t, v in st["tables"].items() if v["state"] == "available" and v["seats"] >= 2)
-        r = c.post("/api/orders", json={"table_id": free, "items": [{"dish_id": "ribeye_steak"}], "party_size": 2}).json()
+        r = c.post("/api/orders", json={"table_id": free, "items": [{"dish_id": "ribeye_steak"}], "party_size": 2}, headers=mgr).json()
         assert r["items"] and r["items"][0]["station"] == "grill"
         assert c.post("/api/online/quote", json={"dish_ids": ["caesar_salad"]}).status_code == 200
-        assert c.post("/api/scenarios/nope").status_code == 400
+        assert c.post("/api/scenarios/nope", headers=mgr).status_code == 400
         with c.websocket_connect("/ws") as ws:
             first = ws.receive_json()
             assert first["type"] == "snapshot" and first["payload"]["tables"]
-            c.post("/api/scenarios/party_of_12")
+            c.post("/api/scenarios/party_of_12", headers=mgr)
             msg = ws.receive_json()
             assert msg["type"] == "batch" and msg["events"]

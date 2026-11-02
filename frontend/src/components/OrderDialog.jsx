@@ -27,6 +27,7 @@ export default function OrderDialog({ state, table, onClose }) {
   const [result, setResult] = useState(null)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
+  const [phone, setPhone] = useState('')
   const avail = useMemo(() => availability(state), [state.inventory, state.menu])
   const specials = new Set((state.menu?.specials || []).map((s) => s.dish_id))
   const free = table.state === 'available'
@@ -35,7 +36,12 @@ export default function OrderDialog({ state, table, onClose }) {
   const submit = async () => {
     setBusy(true); setError('')
     try {
-      const r = await api.tableOrder({ table_id: table.id, items: cart, notes, party_size: free ? Number(size) : null })
+      let guest_id = null
+      if (phone.trim()) {
+        const found = (await api.guests(phone.trim())).find((g) => g.phone === phone.trim())
+        guest_id = found ? found.guest_id : (await api.createGuest({ name: `Guest ${phone.trim()}`, phone: phone.trim() })).guest_id
+      }
+      const r = await api.tableOrder({ table_id: table.id, items: cart, notes, party_size: free ? Number(size) : null, guest_id })
       setResult(r); setCart([])
     } catch (e) { setError(e.message) } finally { setBusy(false) }
   }
@@ -70,12 +76,13 @@ export default function OrderDialog({ state, table, onClose }) {
             {cart.map((it, i) => (
               <div className="cart-row" key={i}>
                 <span>{state.dishes[it.dish_id].name}</span>
-                <input placeholder="mods, e.g. no dairy" value={it.mods}
+                <input aria-label={`Mods for ${state.dishes[it.dish_id].name}`} placeholder="mods, e.g. no dairy" value={it.mods}
                        onChange={(e) => setCart(cart.map((x, j) => (j === i ? { ...x, mods: e.target.value } : x)))} />
                 <button className="ghost" onClick={() => setCart(cart.filter((_, j) => j !== i))} aria-label="Remove">✕</button>
               </div>
             ))}
-            <input className="wide" placeholder="Table notes (e.g. nut allergy)" value={notes} onChange={(e) => setNotes(e.target.value)} />
+            <input className="wide" aria-label="Table notes" placeholder="Table notes (e.g. nut allergy)" value={notes} onChange={(e) => setNotes(e.target.value)} />
+            <input className="wide" aria-label="Guest phone" placeholder="Guest phone (applies saved allergies, earns points)" value={phone} onChange={(e) => setPhone(e.target.value)} />
             <button className="primary" disabled={busy} onClick={submit}>Send to kitchen</button>
           </div>
         )}

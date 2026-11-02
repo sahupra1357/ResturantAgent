@@ -51,6 +51,11 @@ class Party:
     bus_at: float | None = None
     food_order: str | None = None
     food_done: bool = False
+    guest_id: int | None = None
+    booking_id: str | None = None
+    name: str = ""
+    check_id: str | None = None
+    pay_by: float | None = None   # manual parties: auto-settle at the terminal after this
 
     def to_dict(self) -> dict:
         return asdict(self)

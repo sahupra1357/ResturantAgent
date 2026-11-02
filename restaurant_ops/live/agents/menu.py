@@ -4,6 +4,7 @@ Every 86 and every special goes to the manager. It also keeps the 'last N' flags
 """
 from __future__ import annotations
 
+from restaurant_ops.config import settings
 from restaurant_ops.data import catalog as cat
 from restaurant_ops.live import events as E
 from restaurant_ops.live.agents.base import LiveAgent
@@ -13,7 +14,7 @@ BUFFER = 2                 # portions held back when 86-ing "after N more" (alle
 MIN_MARGIN_PCT = 60.0
 SPECIAL_MAX = 12
 SPECIAL_MIN = 4
-MAX_SPECIALS = 2           # active + pending specials at any time
+# active + pending specials at any time: config.Settings.MAX_SPECIALS
 
 
 class MenuAgent(LiveAgent):
@@ -65,7 +66,7 @@ class MenuAgent(LiveAgent):
         svc = self.svc
         pending = sum(1 for d in svc.coordinator.decisions.values() if d["action_type"] == "add_special" and d["status"] == "pending")
         active = sum(1 for d in svc.menu.specials if d != ending)
-        return active + pending < MAX_SPECIALS
+        return active + pending < settings.MAX_SPECIALS
 
     # ------------------------------------------------------------------ triggers
     def on_low(self, ev: E.Event) -> None:
@@ -142,6 +143,26 @@ class MenuAgent(LiveAgent):
                             "after_portions": 0, "remaining_portions": 0},
                 f"86 {cat.DISHES_BY_ID[dish].name} now: out of stock", "a guest ordered it with no stock left", [],
                 key=f"86:{dish}", confidence=0.99, timeout_default="approve")])
+
+    # ------------------------------------------------------------------ menu engineering (prices take effect next service)
+    def start_of_service(self) -> None:
+        svc = self.svc
+        eng = svc.menu_engineering()
+        trace = [{"tool": "menu_engineering", "args": {"days": eng["days"]},
+                  "result": {d["dish_id"]: d["class"] for d in eng["dishes"]}}]
+        props = []
+        for d in eng["dishes"]:
+            sug = d["suggestion"]
+            if sug["action"] == "price_increase":
+                props.append(self.proposal(
+                    "price_change", {"dish_id": d["dish_id"], "old_price": d["price"], "new_price": sug["new_price"],
+                                     "effective": "next service", "reason": sug["why"]},
+                    f"Price {d['name']} {d['price']:.2f} -> {sug['new_price']:.2f} from tomorrow ({d['class']})",
+                    sug["why"], trace, key=f"price:{d['dish_id']}", confidence=0.6, timeout_default="reject"))
+        for r in eng["rotation"]:
+            self.log(f"seasonal rotation: {r['name']} {r['change']} season by {r['by']} ({r['why']})")
+        props.sort(key=lambda x: -(x["payload"]["new_price"] - x["payload"]["old_price"]))
+        self.submit(props[:2], situation={"engineering": [(d["name"], d["class"]) for d in eng["dishes"]]})
 
     # ------------------------------------------------------------------ last-N flags (no approval: informational)
     def refresh_flags(self) -> bool:

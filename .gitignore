@@ -11,3 +11,5 @@ __pycache__/
 data/runs/
 .DS_Store
 data/live/
+# retired Streamlit UI (leftover __pycache__ only)
+ui/

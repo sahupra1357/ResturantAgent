@@ -5,8 +5,9 @@
 - check:    the deterministic constraint checker (core/constraints.py) plus cross-agent conflict rules (e.g. Menu
             wants a salmon special while salmon is short and Procurement has nothing arriving before Friday).
 - approval: LangGraph `interrupt()`; the run pauses on the request and resumes with the manager's answer
-            (approve, reject with a reason, or edit-and-approve). A timeout resumes it with the proposal's safe
-            default (no PO sent, no special published, ...).
+            (approve, reject with a reason, or edit-and-approve). A timeout (APPROVAL_TIMEOUT_SIM_MIN service
+            minutes; a paused clock freezes it) resumes it with the proposal's safe default (no PO sent, ...).
+            Checkpoints live in SQLite next to the service DB, so a paused approval survives a backend restart.
 - verify:   constraints again on the (possibly edited) action, because the world moved while it waited.
 - execute:  the service's handler for the action type; the result goes on the bus as decision.resolved and the
             proposing agent hears about it (a rejection reason lets it re-plan).
@@ -16,7 +17,9 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING, Any, TypedDict
 
-from langgraph.checkpoint.memory import InMemorySaver
+import sqlite3
+
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
@@ -51,12 +54,15 @@ class Coordinator:
         self.open_by_key: dict[str, int] = {}
         self.resolved_by_key: dict[str, dict] = {}
         self.handlers: dict[str, Any] = {}
+        self._ckpt_conn = sqlite3.connect(str(svc.ckpt_path), check_same_thread=False)
+        self.saver = SqliteSaver(self._ckpt_conn)
         self.graph = self._build()
 
     # ------------------------------------------------------------------ approval policy (live service)
     def needs_approval(self, a: dict) -> bool:
         t, p = a["action_type"], a["payload"]
-        if t in ("add_special", "86_dish", "allergen_swap", "comp", "substitute_ingredient"):
+        if t in ("add_special", "86_dish", "allergen_swap", "comp", "substitute_ingredient", "add_staff", "donate_lots",
+                 "price_change", "discount", "refund"):
             return True
         if t in ("place_po", "substitute_supplier"):
             return C.total_of(a) > settings.LIVE_PO_APPROVAL_THRESHOLD
@@ -151,7 +157,7 @@ class Coordinator:
         g.add_conditional_edges("approval", route_approval, ["verify", END])
         g.add_conditional_edges("verify", route_verify, ["execute", END])
         g.add_edge("execute", END)
-        return g.compile(checkpointer=InMemorySaver())
+        return g.compile(checkpointer=self.saver)
 
     def _cfg(self, did: int) -> dict:
         return {"configurable": {"thread_id": f"{self.svc.service_id}:{did}"}}
@@ -173,7 +179,7 @@ class Coordinator:
                                       "timeout_default", "est_cost", "context")}
         d.update(key=key, mode=prop.get("mode", "rule"), needs_approval=self.needs_approval(prop), status="checking",
                  violations=[], created_sim=svc.clock.iso(), created_t=svc.clock.t, resolved_sim=None, note="", result=None,
-                 merged=0, edited=False, timeout_s=settings.APPROVAL_TIMEOUT_S if self.needs_approval(prop) else 0)
+                 merged=0, edited=False, timeout_min=settings.APPROVAL_TIMEOUT_SIM_MIN if self.needs_approval(prop) else 0)
         svc.flush()
         d["id"] = DL.log_decision(svc.service_id, svc.date.isoformat(), d["agent"], d["action_type"], d["payload"],
                                   d["reason"], status="proposed")
@@ -183,7 +189,7 @@ class Coordinator:
         snap = self.graph.get_state(self._cfg(d["id"]))
         if snap.next:  # paused at the approval interrupt
             d["status"] = "pending"
-            d["remaining_s"] = d["timeout_s"]
+            d["remaining_min"] = d["timeout_min"]
             self.open_by_key[key] = d["id"]
             self._db(d)
             svc.metrics.decisions_approval += 1
@@ -214,16 +220,16 @@ class Coordinator:
         self._finish(d, status, out, note=note or ("approved" if approved else "rejected"), approved=approved, by=by)
         return d
 
-    def tick(self, wall_dt: float) -> None:
-        """Count down approval timeouts (wall seconds while the clock runs); expired -> the safe default."""
+    def tick(self, sim_dt_s: float) -> None:
+        """Count down approval timeouts in service minutes (nothing moves while paused); expired -> the safe default."""
         for d in list(self.decisions.values()):
             if d["status"] != "pending":
                 continue
-            d["remaining_s"] = round(d.get("remaining_s", d["timeout_s"]) - wall_dt, 2)
-            if d["remaining_s"] <= 0:
+            d["remaining_min"] = round(d.get("remaining_min", d["timeout_min"]) - sim_dt_s / 60, 3)
+            if d["remaining_min"] <= 0:
                 ok = d.get("timeout_default") == "approve"
-                self.resolve(d["id"], ok, f"timeout after {d['timeout_s']:.0f}s: safe default ({'approve' if ok else 'no action'})",
-                             by="timeout")
+                self.resolve(d["id"], ok, f"timeout after {d['timeout_min']:.0f} service min: safe default "
+                             f"({'approve' if ok else 'no action'})", by="timeout")
             policy = self.svc.auto_policy
             if policy and d["status"] == "pending":
                 ans = policy(self.view(d))
@@ -260,9 +266,15 @@ class Coordinator:
 
     def view(self, d: dict) -> dict:
         keys = ("id", "agent", "action_type", "title", "payload", "reason", "tools", "trace", "confidence", "needs_approval",
-                "status", "violations", "timeout_s", "remaining_s", "timeout_default", "created_sim", "resolved_sim", "note",
+                "status", "violations", "timeout_min", "remaining_min", "timeout_default", "created_sim", "resolved_sim", "note",
                 "mode", "result", "merged", "edited", "est_cost", "resolved_by", "key")
         return {k: d.get(k) for k in keys}
+
+    def close(self) -> None:
+        try:
+            self._ckpt_conn.close()
+        except Exception:  # noqa: BLE001
+            pass
 
     def pending(self) -> list[dict]:
         return [self.view(d) for d in self.decisions.values() if d["status"] == "pending"]

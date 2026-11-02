@@ -34,34 +34,35 @@ def _density(curve: list[float], t_min: float) -> float:
 class GuestSim:
     def __init__(self, seed: int, forecast, reservations: list[dict], curve: list[float]):
         self.rng = np.random.default_rng([seed, 11])
+        # draws added after the first release (regular guests, tips, splits, delivery choice, no-show booking times) use
+        # their own stream, so the guest / walk-in stream of a seed stays the same
+        self.aux = np.random.default_rng([seed, 12])
         self.fc = forecast
         self.curve = curve
         self.walkin_mult = 1.0
         self.online_mult = 1.0
         booked = 0
-        self.bookings: list[dict] = []
+        self.bookings: list[dict] = []   # tonight's book; the host stand (live/host.py) runs arrivals and no-shows
         for r in reservations:
-            if self.rng.random() < NO_SHOW:
-                continue
-            slot = int(self.rng.choice(len(curve), p=np.asarray(curve) / sum(curve)))
-            t = (slot * SLOT_MIN + float(self.rng.uniform(0, SLOT_MIN))) * 60
-            self.bookings.append({"t": t, "size": int(r["party_size"]), "kind": r.get("kind", "standard")})
-            booked += int(r["party_size"])
+            no_show = self.rng.random() < NO_SHOW
+            src = self.aux if no_show else self.rng
+            slot = int(src.choice(len(curve), p=np.asarray(curve) / sum(curve)))
+            t = (slot * SLOT_MIN + float(src.uniform(0, SLOT_MIN))) * 60
+            booked_t = round(t / 900) * 900  # booked on the quarter hour; guests turn up around it
+            self.bookings.append({"t": t, "booked_t": booked_t, "size": int(r["party_size"]), "kind": r.get("kind", "standard"),
+                                  "no_show": no_show})
+            if not no_show:
+                booked += int(r["party_size"])
         self.bookings.sort(key=lambda b: b["t"])
         self.booked_covers = booked
-        self._next_booking = 0
 
     # ------------------------------------------------------------------ arrivals
     def walkin_total(self) -> float:
         return max(0.0, float(self.fc.base.get("p50", 0)) - self.booked_covers)
 
     def arrivals(self, t0: float, t1: float) -> list[dict]:
-        """Parties arriving in (t0, t1] sim seconds: [{t, size, kind}]."""
+        """Walk-in parties arriving in (t0, t1] sim seconds: [{t, size, kind}] (bookings arrive via the host stand)."""
         out = []
-        while self._next_booking < len(self.bookings) and self.bookings[self._next_booking]["t"] <= t1:
-            b = self.bookings[self._next_booking]
-            out.append({"t": b["t"], "size": b["size"], "kind": "reservation" if b["kind"] == "standard" else "private"})
-            self._next_booking += 1
         dt_min = (t1 - t0) / 60
         if dt_min > 0:
             rate_covers = self.walkin_total() * self.walkin_mult * _density(self.curve, t0 / 60)
@@ -161,6 +162,15 @@ class GuestSim:
         lo, hi = {"to_order": (4, 8), "eat": (28, 40), "dessert_after": (15, 22), "pay": (6, 10), "bus": (3, 5),
                   "patience": (18, 28)}[what]
         return float(self.rng.uniform(lo, hi))
+
+    def uniform(self, lo: float, hi: float) -> float:
+        return float(self.aux.uniform(lo, hi))
+
+    def choice(self, seq):
+        return seq[int(self.aux.integers(0, len(seq)))]
+
+    def aux_chance(self, p: float) -> bool:
+        return bool(self.aux.random() < p)
 
     def binomial(self, n: int, p: float) -> int:
         return int(self.rng.binomial(n, p))

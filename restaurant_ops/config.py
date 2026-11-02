@@ -55,9 +55,68 @@ class Settings(BaseSettings):
     LIVE_PERIOD: str = "dinner"  # meal period a live service runs
     LIVE_PO_APPROVAL_THRESHOLD: float = 300.0  # unplanned in-service POs above this need the manager
     LIVE_DISCARD_APPROVAL_VALUE: float = 50.0  # discards worth more than this need the manager
-    APPROVAL_TIMEOUT_S: float = 120.0  # wall seconds (while the clock runs) before the safe default applies
+    APPROVAL_TIMEOUT_SIM_MIN: float = 20.0  # service minutes (paused clock = frozen) before the safe default applies
     LIVE_HOST: str = "127.0.0.1"
     LIVE_PORT: int = 8000
+
+    # --- live agent tunables ---
+    COURSE_GAP_MIN: float = 12.0          # mains fire this long after starters
+    SLAMMED_STREAK_MIN: int = 4           # minutes slammed before the Order agent asks to throttle online orders
+    CALM_STREAK_MIN: int = 10             # minutes calm before online orders reopen
+    COMP_LATE_MIN: float = 10.0           # online order this late past its P90 quote -> comp proposal
+    LOW_DEBOUNCE_MIN: float = 30.0        # stock.low per ingredient at most this often (unless stock halves)
+    EXPIRY_MIN_VALUE: float = 20.0        # lots worth less than this are not announced as expiring
+    EXPIRY_ALERT_DAYS: int = 1            # lead time of lot.expiring alerts (days before expiry)
+    MAX_SPECIALS: int = 2                 # active + pending specials
+    FORECAST_MISS_PCT: float = 15.0
+    FORECAST_MISS_Z: float = 1.5
+    NEGOTIATE_MIN_LINE: float = 150.0     # emergency PO lines worth at least this are negotiated
+    NEGOTIATE_TARGET: float = 0.95        # ask for 5% off list
+
+    # --- prep & staffing (6th agent) ---
+    COOK_HOURLY_RATE: float = 28.0
+    SURGE_LABOR_BUDGET: float = 250.0     # extra labour the agent may spend per service (call-ins)
+    SURGE_SHIFT_HOURS: float = 3.0
+    SURGE_WAIT_MIN: float = 12.0          # station wait that counts as "behind"
+    SURGE_STREAK_MIN: int = 4             # minutes behind before asking to call a cook in
+    CALL_IN_DELAY_MIN: float = 20.0       # a called-in cook arrives after this
+    MAX_EXTRA_COOKS: int = 1              # per station
+    RELEASE_CALM_MIN: int = 30            # minutes calm before an extra cook is released
+    PREP_REVIEW_EVERY_MIN: int = 10
+    PREP_COOKS: int = 1                   # prep cook doing batch mise en place during service
+    SCRATCH_PENALTY: float = 1.3          # cook time x this when nothing is prepped
+
+    # --- front of house ---
+    OVERBOOK_FACTOR: float = 1.1          # booked covers in a 90-min window may reach seats x this
+    NO_SHOW_GRACE_MIN: float = 15.0
+    TAX_RATE: float = 0.08875
+    DISCOUNT_MAX_PCT: float = 30.0
+    DELIVERY_DRIVERS: int = 3
+    DELIVERY_ZONES: dict[str, dict] = {"A": {"label": "under 2 km", "fee": 3.0, "drive_min": 8.0},
+                                       "B": {"label": "2-5 km", "fee": 5.0, "drive_min": 15.0},
+                                       "C": {"label": "5-8 km", "fee": 8.0, "drive_min": 24.0}}
+    DELIVERY_SHARE: float = 0.35          # simulated online orders that are deliveries
+    LOYALTY_POINTS_PER_DOLLAR: float = 1.0
+    LOYALTY_TIERS: dict[str, int] = {"Silver": 500, "Gold": 1500}
+
+    # --- food safety ---
+    TEMP_LOG_EVERY_MIN: int = 30
+    TEMP_LIMITS: dict[str, list[float]] = {"walk_in": [0.0, 5.0], "freezer": [-30.0, -15.0], "hot_holding": [63.0, 90.0]}
+    DONATION_MIN_VALUE: float = 10.0
+
+    # --- auth (roles: manager > server, kitchen) ---
+    AUTH_ENABLED: bool = True
+    MANAGER_TOKEN: str = "manager-dev-token"   # change these outside a demo
+    SERVER_TOKEN: str = "server-dev-token"
+    KITCHEN_TOKEN: str = "kitchen-dev-token"
+
+    # --- operations ---
+    LOG_JSON: bool = False
+    LOG_LEVEL: str = "INFO"
+    LIVE_RETENTION_DAYS: int = 14         # delete live service DBs older than this ...
+    LIVE_KEEP_LAST: int = 20              # ... but always keep the newest N
+    RESUME_ON_START: bool = True          # the server resumes an interrupted service instead of starting fresh
+    SNAPSHOT_EVERY_MIN: int = 5           # service state is saved this often (and on every decision)
 
     # --- LLM ---
     LLM_MODE: str = ""  # "live" | "mock"; empty -> live if the chosen provider has an API key

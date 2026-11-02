@@ -235,11 +235,12 @@ Disruptions (`disruptions.py`), each `{"kind", "day_offset", "params"}`:
 `baseline.py`: fixed par levels (par = mean daily usage × (lead time + 2)), order-up-to every
 morning from the cheapest supplier, no specials, no re-planning.
 
-## UI (Streamlit; removed, replaced by the React app in frontend/ - kept for history)
+## UI
 
-Tabs: **Run** (pick policy/scenario, step a day), **Agent trace** (timeline from `trace`),
-**Approvals** (pending interrupt items → approve/reject with note → resume graph),
-**Forecast** (bands chart + signal report), **KPIs** (agent vs baseline).
+The Streamlit app (`ui/`) is **retired** and no longer in the repository; a leftover local `ui/__pycache__` folder
+can be deleted. The UI is the React app in `frontend/` (see "Real-time layer" and "Round 2" below). The batch week
+is run from the CLI (`python -m restaurant_ops.sim.run`), and its agents-vs-baseline result is shown on the
+dashboard's Insights tab.
 
 ## Config defaults (`config.py`)
 
@@ -259,7 +260,7 @@ LLM_MODEL=anthropic:claude-sonnet-5-5, LANGSMITH_TRACING optional`.
 Build rule: **no tests, scripts or the app are run during the build.** Only dependency installs
 (`uv add`/`uv sync`) and `python -m py_compile` syntax checks are allowed.
 
-## Build notes
+## Build notes (first build, historical)
 
 Phase 1 (Foundation) deviations / additions:
 
@@ -315,7 +316,7 @@ Added `sim/{vendors,disruptions,simulator,baseline,metrics,run}.py`. Nothing was
 - **Metrics**: `kpis(db, run_id, policy)` adds `lost_revenue` (from day_summary trace rows), `food_cost`, `purchases`, `days`, `daily`; `waste_pct` = waste / value received from POs created in the sim. `mape`/`p90_coverage` come from `forecast_log`, which stores the forecast at the start of each service (after the morning cycle and any event cycle, so approved `adjust_forecast` decisions are included). `compare()` returns `agent`, `baseline`, `delta`, `winner`; `format_comparison()` renders a text table.
 - **Run/session**: `SimSession(policy, scenario, run_id, seed, days, auto_approve, source_db)` with `start()`, `step_day()`, `pending_approvals()`, `resume(decisions)`, `run_day(prompt)`, `run_all(prompt, on_day)`, `kpis()`, `close()`; every call re-points the registry DB path and sim date at its own copy, so two sessions can coexist. `run_simulation(...)` runs agent then baseline sequentially; the DB copies are `data/runs/{run_id}_{policy}.db`. Both policies share the run_id (separate DBs).
 
-### Phase 5 (Streamlit UI + README)
+### Phase 5 (Streamlit UI + README) - historical, the Streamlit UI is retired
 
 Added `ui/app.py`, `ui/components.py`, `README.md`. Nothing was run; only `py_compile`.
 
@@ -379,3 +380,86 @@ Live approval policy: specials, 86s, allergen swaps and comps always need the ma
 `ServiceClock` runs the dinner from 17:00 to 22:30 at 0/1/10/60x. `Service.advance(wall_dt)` steps in at most
 15 sim seconds. The kitchen computes exact start and done times inside a step, so the step size does not change
 results. A headless run (`run_headless`) uses the same code without sleeping.
+
+
+## Round 2: operations depth (restaurant_ops/live, core, data)
+
+### Sixth agent: prep & staffing (`live/agents/prep.py`)
+- Mise en place = the forecast prep list (`core/prep.py`) at service start. `Kitchen.fire_hook` consumes one
+  prepped portion per fired item; with none left the item is cooked from scratch (`SCRATCH_PENALTY` x cook time),
+  and `Kitchen.scratch_check` makes quotes reflect that.
+- `prep_batch` (auto, stock-checked) every `PREP_REVIEW_EVERY_MIN` when prepped < 50% of what is still forecast.
+- `add_staff` (manager approval) when a station waits >= `SURGE_WAIT_MIN` for `SURGE_STREAK_MIN` minutes; the
+  constraint checker enforces `SURGE_LABOR_BUDGET` and `MAX_EXTRA_COOKS`. The cook arrives after
+  `CALL_IN_DELAY_MIN` (`Kitchen.set_cooks`); `release_staff` (auto) after `RELEASE_CALM_MIN` calm minutes.
+
+### Procurement: negotiation and supplier learning
+- Emergency PO lines worth >= `NEGOTIATE_MIN_LINE` go through `sim/vendors.negotiate` (target
+  `NEGOTIATE_TARGET` x list); the counter price is used and recorded in the decision's context.
+- `core/suppliers.py`: `scorecard` blends catalog fill rates with PO history at service start; `observe` folds
+  each shortfall / delivery into `suppliers.fill_rate` / `delay_prob` (`supplier_perf` keeps the history). Quotes
+  and the optimizer read those columns, so unreliable suppliers carry a higher risk premium.
+
+### Auth and roles (`live/server.py`)
+Bearer tokens (`MANAGER_TOKEN`, `SERVER_TOKEN`, `KITCHEN_TOKEN`; `?token=` for links). Manager: everything;
+server: orders, bookings, waitlist, tables, checks, guests; kitchen: HACCP checklist, temperatures, tickets.
+Reads, the public online page and the WebSocket are open. `AUTH_ENABLED=false` disables the check for local demos.
+
+### Persistence (`live/persistence.py`)
+Coordinator checkpoints: LangGraph `SqliteSaver` in `{service_id}.ckpt.sqlite`. Service state (world, agents'
+private state, decisions) is pickled to `{service_id}.state.pkl` every `SNAPSHOT_EVERY_MIN` service minutes and on
+every decision event. `Service.resume(service_id)` rebuilds the runtime (bus, agents, coordinator) around the
+restored world; pending approvals resume where they paused. The server resumes the newest `running` service on
+start (`RESUME_ON_START`; `--fresh` to start over).
+
+### Host stand (`live/host.py`)
+Bookings (`bookings` table) with create / cancel / no-show / arrive; simulated bookings come from tonight's
+`reservations` and arrive or no-show by themselves. Overbooking: covers booked within +/-45 min may not exceed
+seats x `OVERBOOK_FACTOR` unless a manager allows it. Waitlist with quoted waits (expected time until a fitting
+table frees, by table state, after the parties ahead). Table operations: move, combine, split.
+
+### Payments and delivery (`live/payments.py`)
+Checks open when a party asks for the bill; due = subtotal - discounts - comps + tax (`TAX_RATE`); even or by-seat
+splits; tips; discounts (<= `DISCOUNT_MAX_PCT`, reason required) and refunds (<= paid) go through the constraint
+checker; every movement is a row in `payments`. A party leaves when its check is paid. Online orders are prepaid;
+deliveries add the zone fee (`DELIVERY_ZONES`) and are dispatched to the first free of `DELIVERY_DRIVERS`
+drivers; their quote adds driver wait + drive time and accuracy is measured at the door.
+
+### Guest profiles (`live/crm.py`)
+`guests` (persistent allergies, preferences, visits, spend, points, tier) and `guest_visits`. Orders linked to a
+guest (booking, phone on the online page or the table dialog) carry the profile's allergies into the Order
+agent's allergen check automatically. Paying a check records the visit and loyalty points.
+
+### Food safety and waste (`live/safety.py`)
+Simulated sensors log walk-in / freezer / hot-holding temperatures every `TEMP_LOG_EVERY_MIN` minutes
+(`temp_log`); an out-of-range reading publishes `temp.alert`, and for the walk-in the Inventory agent quarantines
+the dairy and requests a discard (the cooler-failure scenario now goes through the sensor). HACCP checklist
+(`haccp_checks`): sensor items complete themselves, the rest via the kitchen role; overdue items are logged.
+Expiry alert lead time: `EXPIRY_ALERT_DAYS`. Late in service the Inventory agent proposes donating safe lots that
+expire today and are not needed (`donate_lots`, manager approval, `donations` table; not counted as waste).
+`waste_analytics` breaks waste down by reason, ingredient, category and day.
+
+### Menu engineering (`core/menu_engineering.py`)
+Kasavana-Smith mix x margin classes (star / plowhorse / puzzle / dog), price suggestions under an explicitly
+assumed elasticity (the synthetic history never varies prices), and seasonal rotation from `seasonal_months`.
+At service start the Menu agent proposes up to two `price_change` decisions (approval; effective next service).
+
+### POS import (`data/importer.py`)
+CSV (one row per item sold) -> `covers` / `pos_sales`, with item mapping (file, id, name, fuzzy), meal period from
+the time, covers from guests per check, an unmapped-item report and a dry run; the forecast pickle is removed so
+the models retrain on the imported history.
+
+### Operability (`live/ops.py`)
+JSON logs (`LOG_JSON`), Prometheus `/metrics`, retention of live and batch-run DBs (`LIVE_RETENTION_DAYS`,
+`LIVE_KEEP_LAST`; runs at server start, CLI `python -m restaurant_ops.live.ops`). Every live tunable lives in
+`config.Settings`. Approval timeouts count service minutes (`APPROVAL_TIMEOUT_SIM_MIN`), so a paused clock freezes
+them. If Redis fails mid-service the bus degrades to the in-process queue (`kind` = `redis-degraded`); the SQLite
+event log is unaffected.
+
+### Frontend
+3D dining floor (three.js, lazy-loaded; `floor3d.js` holds the tested scene math): guests walk in through the
+door, sit at their chairs, wait by the host stand and leave when their table is bussed; 2D floor kept as a tab.
+Dashboard tabs: Operations, Front of house (bookings, waitlist, table ops, checks, guests), Kitchen & safety
+(prep & staffing, HACCP, inventory, waste) and Insights (forecast, report, menu engineering, suppliers, baseline).
+Approval alerts (title badge, chime, desktop notification), role sign-in, an end-of-service report (printable HTML
+and CSV), vitest unit tests (`npm test`).

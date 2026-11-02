@@ -1,5 +1,9 @@
 """Online orders: quote before checkout (P50-P90 range from the kitchen-load model), live updates after the order is
-placed, late flags, manager overrides, and the online mode (open / quick_only / paused)."""
+placed, late flags, manager overrides, and the online mode (open / quick_only / paused).
+
+Pickup orders are ready when the slowest item is done plus packing. Deliveries add the zone's fee; the quote adds
+the expected wait for a free driver and the drive time, and the order goes cooking -> out_for_delivery -> delivered.
+Quote accuracy is measured on the promised moment (pickup: ready; delivery: at the door)."""
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
@@ -23,13 +27,22 @@ class OnlineOrder:
     quote_p90_t: float
     cur_p50_t: float
     cur_p90_t: float
-    status: str = "cooking"          # cooking -> ready -> picked_up
+    status: str = "cooking"          # cooking -> ready -> picked_up | cooking -> out_for_delivery -> delivered
     ready_t: float | None = None
     override_t: float | None = None
     notified_p90_t: float | None = None
     notifications: list[dict] = field(default_factory=list)
     reason: str = ""
     source: str = "sim"              # sim | web
+    fulfilment: str = "pickup"       # pickup | delivery
+    zone: str | None = None
+    fee: float = 0.0
+    check_id: str | None = None
+    guest_id: int | None = None
+    driver_id: str | None = None
+    depart_t: float | None = None
+    delivered_t: float | None = None
+    extra_min: float = 0.0           # delivery: driver wait + drive added to the kitchen estimate at quote time
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -50,13 +63,13 @@ class OnlineBook:
         return dict(available)
 
     def active(self) -> list[OnlineOrder]:
-        return [o for o in self.orders.values() if o.status != "picked_up"]
+        return [o for o in self.orders.values() if o.status not in ("picked_up", "delivered")]
 
     def view(self, o: OnlineOrder, clock, late_by: float | None = None) -> dict:
         shown50 = o.override_t if o.override_t is not None else o.cur_p50_t
         shown90 = o.override_t + 5 * 60 if o.override_t is not None else o.cur_p90_t
         now = clock.t
-        late = o.status == "cooking" and now > o.quote_p90_t
+        late = o.status in ("cooking", "out_for_delivery") and now > o.quote_p90_t
         return {"order_id": o.order_id, "customer": o.customer, "status": o.status, "total": o.total,
                 "items": [{"dish_id": d, "name": cat.DISHES_BY_ID[d].name} for d in o.dishes],
                 "item_ids": o.item_ids, "placed": clock.iso(o.placed_t),
@@ -67,7 +80,10 @@ class OnlineBook:
                 "ready": clock.iso(o.ready_t) if o.ready_t is not None else None,
                 "late": late, "late_by_min": round(max(0.0, (now - o.quote_p90_t) / 60), 1) if late else 0.0,
                 "slip_min": round((o.cur_p90_t - o.quote_p90_t) / 60, 1), "override": o.override_t is not None,
-                "notifications": o.notifications[-6:], "reason": o.reason, "source": o.source}
+                "notifications": o.notifications[-6:], "reason": o.reason, "source": o.source,
+                "fulfilment": o.fulfilment, "zone": o.zone, "fee": o.fee, "check_id": o.check_id, "guest_id": o.guest_id,
+                "driver_id": o.driver_id, "delivered": clock.iso(o.delivered_t) if o.delivered_t is not None else None,
+                "eta_hhmm": clock.hhmm(o.delivered_t) if o.delivered_t is not None else None}
 
 
 def order_total(dishes: list[str]) -> float:

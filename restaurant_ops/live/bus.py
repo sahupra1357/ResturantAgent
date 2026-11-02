@@ -103,6 +103,7 @@ class RedisStreamsBus(EventBus):
     """Transport = a Redis stream. publish XADDs; drain XREADs from the last id seen and dispatches in order.
 
     External consumers (another process, a real POS bridge) can read the same stream with XREAD / consumer groups.
+    If Redis fails mid-service the bus degrades to the in-process queue (kind 'redis-degraded') and keeps dispatching.
     """
 
     kind = "redis"
@@ -113,12 +114,26 @@ class RedisStreamsBus(EventBus):
         self.r = client
         self.stream = f"ro:events:{service_id}"
         self.last_id = "0-0"
+        self.degraded = False
 
     def _push(self, ev: Event) -> None:
-        self.r.xadd(self.stream, {"e": json.dumps(ev.to_dict(), default=str)}, maxlen=self.MAXLEN, approximate=True)
+        if self.degraded:
+            self._q.append(ev)
+            return
+        try:
+            self.r.xadd(self.stream, {"e": json.dumps(ev.to_dict(), default=str)}, maxlen=self.MAXLEN, approximate=True)
+        except Exception as e:  # noqa: BLE001  Redis went away: keep the floor running on the in-process queue
+            self._degrade(e)
+            self._q.append(ev)
 
     def _pop(self) -> Event | None:
-        got = self.r.xread({self.stream: self.last_id}, count=1)
+        if self.degraded:
+            return self._q.popleft() if self._q else None
+        try:
+            got = self.r.xread({self.stream: self.last_id}, count=1)
+        except Exception as e:  # noqa: BLE001
+            self._degrade(e)
+            return self._q.popleft() if self._q else None
         if not got:
             return None
         _, entries = got[0]
@@ -128,6 +143,14 @@ class RedisStreamsBus(EventBus):
         self.last_id = eid if isinstance(eid, str) else eid.decode()
         raw = fields.get("e") if "e" in fields else fields.get(b"e")
         return Event.from_dict(json.loads(raw if isinstance(raw, str) else raw.decode()))
+
+    def _degrade(self, err: Exception) -> None:
+        """Switch to the in-process queue. Events stay in event_log (SQLite), so replay and the UI are unaffected."""
+        self.degraded = True
+        self.kind = "redis-degraded"
+        msg = f"Redis unavailable ({type(err).__name__}: {err}); continuing on the in-process queue"
+        log.error(msg)
+        self.errors.append(msg)
 
     def close(self) -> None:
         try:

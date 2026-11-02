@@ -23,26 +23,34 @@ from restaurant_ops.agents import decision_log as DL
 from restaurant_ops.agents import llm
 from restaurant_ops.agents import supervisor as SUP
 from restaurant_ops.config import settings, sim_start_from_db
-from restaurant_ops.core import prep
+from restaurant_ops.core import menu_engineering as ME
+from restaurant_ops.core import prep as prep_core
+from restaurant_ops.core import suppliers as SUPL
 from restaurant_ops.data import catalog as cat
 from restaurant_ops.db.connection import copy_db, get_conn, init_db
 from restaurant_ops.live import events as E
+from restaurant_ops.live import persistence as PERSIST
 from restaurant_ops.live import scenarios as SC
 from restaurant_ops.live.agents.forecasting import ForecastingAgent
 from restaurant_ops.live.agents.inventory import InventoryAgent
 from restaurant_ops.live.agents.menu import MenuAgent
 from restaurant_ops.live.agents.order import OrderAgent
+from restaurant_ops.live.agents.prep import PrepAgent
 from restaurant_ops.live.agents.procurement import ProcurementAgent
 from restaurant_ops.live.bus import make_bus
 from restaurant_ops.live.clock import ServiceClock
 from restaurant_ops.live.coordinator import Coordinator
+from restaurant_ops.live.crm import CRM
 from restaurant_ops.live.floor import LAYOUT_FIXTURES, Floor, Party
 from restaurant_ops.live.guests import GuestSim
+from restaurant_ops.live.host import HostError, HostStand
 from restaurant_ops.live.intraday import IntradayForecast
 from restaurant_ops.live.kitchen import PACK_BUFFER_MIN, Kitchen, cook_minutes, is_quick
 from restaurant_ops.live.menu_live import LiveMenu
 from restaurant_ops.live.metrics import Metrics
 from restaurant_ops.live.online import NOTIFY_SLIP_MIN, PICKUP_AFTER_MIN, OnlineBook, OnlineOrder, order_total
+from restaurant_ops.live.payments import Dispatcher, PaymentError, Payments
+from restaurant_ops.live.safety import FoodSafety, record_donation, waste_analytics
 from restaurant_ops.live.stock import LiveStock
 from restaurant_ops.live.tools import ToolBox
 from restaurant_ops.tools import registry as R
@@ -56,7 +64,7 @@ LATE_TICKET_MIN = 25.0
 BAR_SHARE = 0.35
 FEED_SKIP = {E.CLOCK_TICK, E.KITCHEN_LOAD, E.INVENTORY_SNAPSHOT, E.KPI_UPDATED, E.TABLE_UPDATED, E.QUOTE_UPDATED,
              E.MENU_UPDATED, E.ONLINE_ORDER, E.ITEM_FIRED, E.ITEM_DONE, E.ORDER_SUBMITTED, E.SERVICE_STARTED,
-             E.FORECAST_UPDATED}
+             E.FORECAST_UPDATED, E.HOST_UPDATED, E.CHECK_UPDATED, E.PREP_UPDATED, E.SAFETY_UPDATED}
 DISH_VIEW = {d.id: {"dish_id": d.id, "name": d.name, "category": d.category, "price": d.price, "station": d.station,
                     "cook_min": cook_minutes(d.id), "quick": is_quick(d.id), "allergens": cat.dish_allergens(d.id)}
              for d in cat.DISHES}
@@ -87,14 +95,12 @@ class Service:
         R.set_db_path(self.db_path)
         R.set_sim_date(self.date)
         self.clock = ServiceClock(self.date, self.period, speed)
-        self.bus = make_bus(self.service_id, self.conn, clock=lambda: self.clock.iso(), kind=bus_kind)
         self.conn.execute("INSERT INTO service_runs (service_id, service_date, meal_period, seed, started_ts, bus, llm_mode) "
                           "VALUES (?,?,?,?,?,?,?)", (self.service_id, self.date.isoformat(), self.period, self.seed,
-                                                     E.wall_now(), self.bus.kind, "mock" if llm.is_mock() else llm.describe()))
+                                                     E.wall_now(), "pending", "mock" if llm.is_mock() else llm.describe()))
         self.conn.commit()
-        self.auto_policy = auto_policy
         # world
-        staff = prep.station_staff(self.conn, self.date.isoformat(), self.period)
+        staff = prep_core.station_staff(self.conn, self.date.isoformat(), self.period)
         self.kitchen = Kitchen(staff, self.seed)
         self.stock = LiveStock(self.conn, self.date)
         self.forecast = IntradayForecast(self.date, self.period)
@@ -105,7 +111,10 @@ class Service:
         res = [dict(r) for r in self.conn.execute("SELECT party_size, kind FROM reservations WHERE date=? AND meal_period=? "
                                                   "ORDER BY id", (self.date.isoformat(), self.period))]
         self.guests = GuestSim(self.seed, self.forecast, res, self.forecast.curve)
-        self.tools = ToolBox(self)
+        self.host = HostStand(self)
+        self.payments = Payments(self)
+        self.dispatcher = Dispatcher(settings.DELIVERY_DRIVERS)
+        self.safety = FoodSafety(self)
         # bookkeeping
         self.committed: dict[str, int] = {}
         self.item_skip: dict[str, list] = {}
@@ -118,25 +127,86 @@ class Service:
         self.order_fire: dict[str, float] = {}
         self.counted_items: set[str] = set()
         self._n_party = self._n_order = self._n_online = self._n_cust = 0
-        self.pending_llm: list[dict] = []
-        self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="llm")
         self.feed: deque = deque(maxlen=250)
         self.status = "ready"
         self._last_quote_view: dict[str, tuple] = {}
         self.schedule: list[tuple[float, str]] = []  # (t_min, scenario) for headless runs
-        # coordinator + agents
+        self.sim_since_snapshot = 0.0
+        self._init_runtime(bus_kind, auto_policy)
+        self.conn.execute("UPDATE service_runs SET bus=? WHERE service_id=?", (self.bus.kind, self.service_id))
+        regulars = self.crm.seed_regulars(self.seed)
+        for b in self.guests.bookings:  # tonight's book goes to the host stand
+            rid = self.guests.choice(regulars) if regulars and self.guests.aux_chance(0.3) else None
+            g = self.crm.get(rid) if rid else None
+            self.host.create(g["name"] if g else f"Booking {len(self.host.bookings) + 1}", b["size"], t=b["booked_t"],
+                             guest_id=rid, source="sim", arrive_t=None if b["no_show"] else b["t"], allow_overbook=True,
+                             publish=False)
+        self.conn.commit()
+
+    def _init_runtime(self, bus_kind: str | None, auto_policy: Policy | None) -> None:
+        """Everything that is rebuilt (not restored) on resume: bus, tools, CRM, coordinator, agents, subscriptions."""
+        self.ckpt_path = settings.LIVE_DIR / f"{self.service_id}.ckpt.sqlite"
+        self.bus = make_bus(self.service_id, self.conn, clock=lambda: self.clock.iso(), kind=bus_kind)
+        self.auto_policy = auto_policy
+        self.tools = ToolBox(self)
+        self.crm = CRM(self.conn)
+        for obj in (self.host, self.payments, self.safety):
+            obj.svc = self
+        self.stock.conn = self.conn
+        self.pending_llm: list[dict] = []
+        self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="llm")
         self.coordinator = Coordinator(self)
         self.order = OrderAgent(self)
         self.inventory = InventoryAgent(self)
         self.forecasting = ForecastingAgent(self)
         self.procurement = ProcurementAgent(self)
         self.menu_agent = MenuAgent(self)
-        self.agents = {a.name: a for a in (self.order, self.inventory, self.forecasting, self.procurement, self.menu_agent)}
+        self.prep = PrepAgent(self)
+        self.agents = {a.name: a for a in (self.order, self.inventory, self.forecasting, self.procurement, self.menu_agent, self.prep)}
         self._register_handlers()
         self.bus.subscribe(E.ORDER_CREATED, self._on_order_created, "service.order_created")
         self.bus.subscribe(E.ITEM_FIRED, self._on_item_fired, "service.item_fired")
         self.bus.subscribe(E.ITEM_DONE, self._on_item_done, "service.item_done")
+        self.bus.subscribe(E.DECISION_PROPOSED, self._on_decision, "service.snapshot_on_decision")
+        self.bus.subscribe(E.DECISION_RESOLVED, self._on_decision, "service.snapshot_on_decision")
         self.bus.subscribe("*", self._to_feed, "service.feed")
+
+    @classmethod
+    def resume(cls, service_id: str, auto_policy: Policy | None = None, bus_kind: str | None = None) -> "Service":
+        """Continue a service after a backend restart from its saved state, DB and approval checkpoints."""
+        blob = PERSIST.load(service_id)
+        svc = cls.__new__(cls)
+        for k, v in blob["world"].items():
+            setattr(svc, k, v)
+        svc.db_path = settings.LIVE_DIR / f"{service_id}.db"
+        svc.conn = get_conn(svc.db_path)
+        svc.conn.execute("PRAGMA synchronous = NORMAL")
+        init_db(svc.conn)
+        R.set_db_path(svc.db_path)
+        R.set_sim_date(svc.date)
+        svc._init_runtime(bus_kind, auto_policy)
+        svc.bus.seq = int(svc.conn.execute("SELECT COALESCE(MAX(seq),0) FROM event_log WHERE service_id=?", (service_id,)).fetchone()[0])
+        for name, state in blob["agents"].items():
+            if name in svc.agents:
+                svc.agents[name].__dict__.update(state)
+        svc.prep.attach()
+        c = blob["coordinator"]
+        svc.coordinator.decisions, svc.coordinator.open_by_key, svc.coordinator.resolved_by_key = (
+            c["decisions"], c["open_by_key"], c["resolved_by_key"])
+        svc.bus.publish(E.AGENT_LOG, {"agent": "service", "message": f"service resumed at {svc.clock.hhmm()} with "
+                                      f"{len(svc.coordinator.pending())} approval(s) still pending"})
+        svc.bus.publish(E.SERVICE_STARTED, {"service": svc.info(), "snapshot": svc.snapshot(), "resumed": True})
+        svc.flush()
+        return svc
+
+    def save_state(self) -> Path:
+        self.flush()
+        self.sim_since_snapshot = 0.0
+        return PERSIST.save(self)
+
+    def _on_decision(self, ev: E.Event) -> None:
+        if self.status == "running":
+            self.save_state()
 
     # ================================================================== lifecycle
     def start(self) -> None:
@@ -144,11 +214,17 @@ class Service:
             return
         self.bus.publish(E.SERVICE_STARTED, {"service": self.info(), "snapshot": self.snapshot()})
         self.status = "running"
+        self.safety.create_checklist()
+        self.safety.log()
+        self.procurement.start_of_service()
         self.inventory.start_of_service()
+        self.prep.start_of_service()
         self.forecasting.nightly()
         self.forecasting.publish("service start: model forecast for tonight")
+        self.menu_agent.start_of_service()
+        self.host.publish()
         self._publish_state()
-        self.flush()
+        self.save_state()
 
     def advance(self, wall_dt: float) -> None:
         """Move the service forward by wall_dt real seconds at the clock speed (no-op while paused or finished)."""
@@ -159,18 +235,21 @@ class Service:
         while sim > 1e-9 and self.status == "running":
             dt = min(STEP_S, sim)
             self._step(dt)
+            self.coordinator.tick(dt)
             sim -= dt
-        self.coordinator.tick(wall_dt)
+        self.sim_since_snapshot += wall_dt * self.clock.speed
+        if self.status == "running" and self.sim_since_snapshot >= settings.SNAPSHOT_EVERY_MIN * 60:
+            self.save_state()
         self.flush()
 
     def run_headless(self, until_end: bool = True, minutes: float | None = None, wall_step: float = 0.25) -> dict:
-        """Run without wall-clock sleeps (tests, CLI). Approval timeouts still count wall time at the clock speed."""
+        """Run without wall-clock sleeps (tests, CLI). Approval timeouts count service minutes, as in the live server."""
         if self.status == "ready":
             self.start()
         target = self.clock.t + minutes * 60 if minutes is not None else math.inf
         while self.status == "running" and self.clock.t < target:
             self.advance(wall_step)
-        return self.metrics.kpis(self.forecast)
+        return self.kpis()
 
     def end(self) -> None:
         if self.status == "ended":
@@ -181,15 +260,21 @@ class Service:
         err = {"forecast_p50": fc.get("p50"), "actual": actual,
                "ape_pct": round(abs(actual - fc["p50"]) / max(actual, 1) * 100, 1) if fc.get("p50") else None,
                "in_p10_p90": bool(fc.get("p10", 0) <= actual <= fc.get("p90", 0)) if fc else None}
-        self.bus.publish(E.SERVICE_ENDED, {"kpis": self.metrics.kpis(self.forecast), "forecast_error": err})
+        self.forecast_error = err
+        self.bus.publish(E.SERVICE_ENDED, {"kpis": self.kpis(), "forecast_error": err})
         self.forecasting.nightly()
         self.conn.execute("UPDATE service_runs SET status='ended' WHERE service_id=?", (self.service_id,))
         self.flush()
+        try:
+            PERSIST.save(self)
+        except Exception:  # noqa: BLE001  the report and DB are what matter after the end
+            pass
 
     def close(self) -> None:
         self.flush()
         self.executor.shutdown(wait=False, cancel_futures=True)
         self.bus.close()
+        self.coordinator.close()
         self.conn.close()
 
     def flush(self) -> None:
@@ -204,6 +289,7 @@ class Service:
         for t_min, name in [s for s in self.schedule if s[0] * 60 <= t1]:
             self.schedule.remove((t_min, name))
             self.inject(name)
+        self.host.step(t0, t1)
         if t1 / 60 <= end_min - LAST_SEATING_BEFORE_END_MIN:
             for a in self.guests.arrivals(t0, t1):
                 self._arrive(a["size"], a["kind"], a["t"])
@@ -234,13 +320,16 @@ class Service:
         self._refresh_quotes(load)
         for a in self.agents.values():
             a.on_tick(float(m))
+        self.safety.on_minute(m)
+        if m % 5 == 0 and self.floor.waitlist:
+            self.host.publish()
         if self.inventory_dirty:
             self.inventory_dirty = False
             if self.menu_agent.refresh_flags():
                 self.bus.publish(E.MENU_UPDATED, self.menu.snapshot(), source="menu")
             self.bus.publish(E.INVENTORY_SNAPSHOT, self.inventory_view(), source="inventory")
         if m % 2 == 0:
-            self.bus.publish(E.KPI_UPDATED, self.metrics.kpis(self.forecast), source="service")
+            self.bus.publish(E.KPI_UPDATED, self.kpis(), source="service")
 
     def _llm(self) -> None:
         now = time.monotonic()
@@ -251,9 +340,11 @@ class Service:
                 entry["agent"].finish_review(entry["proposals"], fut if fut.done() else None)
 
     # ================================================================== floor
-    def _arrive(self, size: int, kind: str, t: float, preorder: bool = False) -> Party:
+    def _arrive(self, size: int, kind: str, t: float, preorder: bool = False, guest_id: int | None = None,
+                booking_id: str | None = None, name: str = "", patience: object = "default") -> Party:
         self._n_party += 1
-        p = Party(f"P{self._n_party:03d}", int(size), kind, t, preorder=preorder)
+        p = Party(f"P{self._n_party:03d}", int(size), kind, t, preorder=preorder, guest_id=guest_id, booking_id=booking_id,
+                  name=name)
         self.floor.parties[p.id] = p
         self.metrics.parties += 1
         self.metrics.covers_arrived += p.size
@@ -261,15 +352,24 @@ class Service:
         if seats:
             self._seat(p, seats, self.clock.t)
         else:
-            p.patience_until = None if preorder else self.clock.t + self.guests.minutes("patience") * 60
+            if preorder or kind == "reservation" or patience is None:
+                p.patience_until = None  # booked guests and named waitlist entries wait for their table
+            else:
+                p.patience_until = self.clock.t + self.guests.minutes("patience") * 60
             self.floor.waitlist.append(p.id)
+            self.host.on_waitlisted(p)
         self.bus.publish(E.PARTY_ARRIVED, {"party_id": p.id, "size": p.size, "kind": kind, "seated": bool(seats),
-                                           "table_ids": p.table_ids, "waitlist": len(self.floor.waitlist)}, source="floor")
+                                           "table_ids": p.table_ids, "waitlist": len(self.floor.waitlist),
+                                           "guest_id": guest_id, "booking_id": booking_id}, source="floor")
+        if not seats:
+            self.host.publish()
         return p
 
     def _seat(self, p: Party, seats: list[str], t: float) -> None:
         self.floor.seat(p, seats, t)
         self.metrics.covers_seated += p.size
+        self.host.on_seated(p)
+        self.host.quotes.pop(p.id, None)
         if p.food_order:
             p.state = "eating" if p.food_done else "entrees_fired"
             self.floor.set_state(p, p.state)
@@ -291,11 +391,14 @@ class Service:
                 self.floor.waitlist.remove(pid)
                 p.state, p.gave_up = "left", True
                 self.metrics.covers_lost += p.size
+                self.host.quotes.pop(pid, None)
                 self.bus.publish(E.PARTY_LEFT, {"party_id": pid, "size": p.size, "reason": "gave up waiting"}, source="floor")
+                self.host.publish()
                 continue
             seats = self.floor.find_seating(p.size)
             if seats:
                 self._seat(p, seats, t)
+                self.host.publish()
 
     def _party_timers(self, t: float) -> None:
         for p in list(self.floor.parties.values()):
@@ -310,21 +413,44 @@ class Service:
             if p.state == "eating" and p.check_at is not None and p.check_at <= t:
                 p.check_at = None
                 p.state = "check"
+                c = self.payments.open_for_party(p)
+                p.check_id = c.check_id
                 p.leave_at = t + self.guests.minutes("pay") * 60
+                if p.kind == "manual":
+                    p.pay_by = t + 20 * 60  # a hand-placed table pays through the API (or at the terminal after 20 min)
                 self.floor.set_state(p, "check")
                 self._tables(p)
             elif p.state == "check" and p.leave_at is not None and p.leave_at <= t:
-                p.state = "bussing"
-                p.bus_at = t + self.guests.minutes("bus") * 60
-                self.floor.set_state(p, "bussing")
-                self.bus.publish(E.PARTY_LEFT, {"party_id": p.id, "size": p.size, "reason": "paid"}, source="floor")
-                self._tables(p)
+                c = self.payments.checks.get(p.check_id or "")
+                if c is not None and c.status == "open":
+                    if p.kind == "manual" and (p.pay_by or 0) > t:
+                        continue
+                    split = 2 if p.size >= 4 and self.guests.aux_chance(0.2) else 1
+                    self.payments.settle_sim(c, tip_pct=self.guests.uniform(0.15, 0.22), split_ways=split)
+                else:
+                    self._party_leaves(p, t)
             elif p.state == "bussing" and p.bus_at is not None and p.bus_at <= t:
                 tids = list(p.table_ids)
                 for tid in tids:
                     self.floor.release(tid)
                 p.state = "left"
                 self.bus.publish(E.TABLE_UPDATED, {"tables": [self.floor.table_view(tid, t) for tid in tids]}, source="floor")
+
+    def _party_leaves(self, p: Party, t: float) -> None:
+        if p.state != "check":
+            return
+        p.state = "bussing"
+        p.leave_at = None
+        p.bus_at = t + self.guests.minutes("bus") * 60
+        self.floor.set_state(p, "bussing")
+        self.bus.publish(E.PARTY_LEFT, {"party_id": p.id, "size": p.size, "reason": "paid"}, source="floor")
+        self._tables(p)
+
+    def on_check_paid(self, c) -> None:
+        """Payments closed a check: the party leaves (dine-in) and the guest's visit is on their profile."""
+        p = self.floor.parties.get(c.party_id or "")
+        if p is not None:
+            self._party_leaves(p, self.clock.t)
 
     def _place_food_order(self, p: Party) -> dict:
         o = self.guests.party_order(p.size, self.available_map(), set(self.menu.specials), large=p.kind == "large")
@@ -339,7 +465,8 @@ class Service:
 
     # ================================================================== orders
     def submit_order(self, channel: str, items: list[dict], notes: str = "", party: Party | None = None, kind: str = "food",
-                     customer: str = "", source: str = "sim") -> dict:
+                     customer: str = "", source: str = "sim", guest_id: int | None = None, fulfilment: str = "pickup",
+                     zone: str | None = None) -> dict:
         t0 = time.perf_counter()
         if channel == "online":
             self._n_online += 1
@@ -353,7 +480,9 @@ class Service:
         payload = {"order_id": oid, "channel": channel, "items": items, "notes": notes, "kind": kind,
                    "party_id": party.id if party else None, "party_size": party.size if party else 0,
                    "table_ids": list(party.table_ids) if party else [], "large": bool(party and party.kind == "large"),
-                   "customer": customer, "source": source, "t0": t0}
+                   "customer": customer, "source": source, "t0": t0,
+                   "guest_id": guest_id if guest_id is not None else (party.guest_id if party else None),
+                   "fulfilment": fulfilment if channel == "online" else None, "zone": zone if channel == "online" else None}
         self.bus.publish(E.ORDER_SUBMITTED, payload, source="online" if channel == "online" else "floor")
         res = self.order_results.get(oid, {"order_id": oid, "items": [], "held": [], "rejected": []})
         if channel == "online":
@@ -440,7 +569,8 @@ class Service:
         if p is not None and p.food_order == order["order_id"]:
             self._maybe_food_done(p, order["order_id"])
 
-    def manual_order(self, table_id: str, items: list[dict], notes: str = "", party_size: int | None = None) -> dict:
+    def manual_order(self, table_id: str, items: list[dict], notes: str = "", party_size: int | None = None,
+                     guest_id: int | None = None) -> dict:
         """A person clicks a table on the floor and enters an order (seats a party first if the table is free)."""
         if table_id not in self.floor.tables:
             raise ServiceError(f"unknown table {table_id}")
@@ -451,7 +581,7 @@ class Service:
                 raise ServiceError(f"{table_id} is {t.state}")
             self._n_party += 1
             size = int(party_size or min(t.seats, max(1, len(items))))
-            p = Party(f"P{self._n_party:03d}", size, "manual", self.clock.t)
+            p = Party(f"P{self._n_party:03d}", size, "manual", self.clock.t, guest_id=guest_id)
             self.floor.parties[p.id] = p
             self.metrics.parties += 1
             self.metrics.covers_arrived += size
@@ -461,7 +591,9 @@ class Service:
         kind = "food" if not p.food_order else "extra"
         if all(cat.DISHES_BY_ID[i["dish_id"]].category == "dessert" for i in items if i["dish_id"] in cat.DISHES_BY_ID):
             kind = "dessert" if p.food_order else "food"
-        return self.submit_order("dine_in", items, notes=notes, party=p, kind=kind, source="manual")
+        if guest_id and not p.guest_id:
+            p.guest_id = guest_id
+        return self.submit_order("dine_in", items, notes=notes, party=p, kind=kind, source="manual", guest_id=guest_id or p.guest_id)
 
     # ================================================================== online channel
     def _sim_online_order(self) -> None:
@@ -472,7 +604,10 @@ class Service:
         cart = self.guests.online_cart(allowed, set(self.menu.specials))
         if cart:
             self._n_cust += 1
-            self.submit_order("online", cart, customer=f"Guest {self._n_cust}", source="sim")
+            delivery = self.guests.aux_chance(settings.DELIVERY_SHARE)
+            zone = self.guests.choice(sorted(settings.DELIVERY_ZONES)) if delivery else None
+            self.submit_order("online", cart, customer=f"Guest {self._n_cust}", source="sim",
+                              fulfilment="delivery" if delivery else "pickup", zone=zone)
 
     def online_menu(self) -> dict:
         avail = self.available_map()
@@ -488,22 +623,49 @@ class Service:
             if d in self.menu.eighty_sixed:
                 continue  # hidden online at once
             rows.append(v)
-        return {"mode": self.online.mode, "reason": self.online.mode_reason, "dishes": rows}
+        return {"mode": self.online.mode, "reason": self.online.mode_reason, "dishes": rows,
+                "zones": settings.DELIVERY_ZONES, "tax_rate": settings.TAX_RATE}
 
-    def quote_preview(self, dish_ids: list[str]) -> dict:
+    def _delivery_extra(self, zone: str, ready_t: float) -> float:
+        z = Dispatcher.zone(zone)
+        return self.dispatcher.driver_wait_min(ready_t) + z["drive_min"]
+
+    def quote_preview(self, dish_ids: list[str], fulfilment: str = "pickup", zone: str | None = None) -> dict:
         load = self.kitchen_load()
         q = self.kitchen.quote(dish_ids, self.clock.t, PACK_BUFFER_MIN)
-        return {**q, "range_hhmm": [self.clock.hhmm(self.clock.t + q["p50_min"] * 60), self.clock.hhmm(self.clock.t + q["p90_min"] * 60)],
-                "busyness": load["busyness"], "explanation": self.order.explain(load), "mode": self.online.mode}
+        extra = 0.0
+        if fulfilment == "delivery":
+            extra = self._delivery_extra(zone or "A", self.clock.t + q["p50_min"] * 60)
+        p50, p90 = q["p50_min"] + extra, q["p90_min"] + extra * 1.15
+        fee = Dispatcher.zone(zone or "A")["fee"] if fulfilment == "delivery" else 0.0
+        return {**q, "p50_min": round(p50, 1), "p90_min": round(p90, 1), "kitchen_p50_min": q["p50_min"], "delivery_min": round(extra, 1),
+                "range_hhmm": [self.clock.hhmm(self.clock.t + p50 * 60), self.clock.hhmm(self.clock.t + p90 * 60)],
+                "busyness": load["busyness"], "explanation": self.order.explain(load), "mode": self.online.mode,
+                "fulfilment": fulfilment, "zone": zone, "fee": fee}
 
-    def place_online(self, items: list[dict], customer: str = "Web guest") -> dict:
+    def place_online(self, items: list[dict], customer: str = "Web guest", fulfilment: str = "pickup", zone: str | None = None,
+                     phone: str = "") -> dict:
         allowed = self.online.allowed(self.available_map())
         if self.online.mode == "paused":
             raise ServiceError("online ordering is paused: the kitchen is slammed")
+        if fulfilment not in ("pickup", "delivery"):
+            raise ServiceError("fulfilment must be pickup or delivery")
+        if fulfilment == "delivery":
+            if not zone:
+                raise ServiceError("delivery needs a zone")
+            try:
+                Dispatcher.zone(zone)
+            except PaymentError as e:
+                raise ServiceError(str(e)) from e
         bad = [i["dish_id"] for i in items if i["dish_id"] not in allowed]
         if bad:
             raise ServiceError(f"not available online right now: {', '.join(cat.DISHES_BY_ID[b].name for b in bad if b in cat.DISHES_BY_ID)}")
-        return self.submit_order("online", items, customer=customer, source="web")
+        guest_id = None
+        if phone:
+            g = self.crm.by_phone(phone) or self.crm.upsert(customer, phone=phone)
+            guest_id = g["guest_id"]
+        return self.submit_order("online", items, customer=customer, source="web", guest_id=guest_id, fulfilment=fulfilment,
+                                 zone=zone if fulfilment == "delivery" else None)
 
     def _online_register(self, o: dict) -> None:
         t = self.clock.t
@@ -511,17 +673,24 @@ class Service:
             oo = self.online.orders[o["order_id"]]
             oo.item_ids = [i["item_id"] for i in o["items"]]
             oo.dishes = [i["dish_id"] for i in o["items"]]
-            oo.total = order_total(oo.dishes)
+            oo.total = round(order_total(oo.dishes) + oo.fee, 2)
             return
         items = [self.kitchen.items[i["item_id"]] for i in o["items"]]
         if not items:
             return
         est = self.kitchen.estimate_items(items, t, PACK_BUFFER_MIN)
         load = self.kitchen_load()
-        oo = OnlineOrder(o["order_id"], self._customer_of(o), [i.item_id for i in items], [i.dish_id for i in items],
-                         order_total([i.dish_id for i in items]), t, t + est["p50_min"] * 60, t + est["p90_min"] * 60,
-                         t + est["p50_min"] * 60, t + est["p90_min"] * 60, reason=self.order.explain(load),
-                         source=self._source_of(o))
+        fulfil = o.get("fulfilment") or "pickup"
+        zone = o.get("zone")
+        extra = self._delivery_extra(zone, t + est["p50_min"] * 60) if fulfil == "delivery" else 0.0
+        fee = Dispatcher.zone(zone)["fee"] if fulfil == "delivery" else 0.0
+        p50, p90 = t + (est["p50_min"] + extra) * 60, t + (est["p90_min"] + extra * 1.15) * 60
+        dishes = [i.dish_id for i in items]
+        oo = OnlineOrder(o["order_id"], self._customer_of(o), [i.item_id for i in items], dishes,
+                         round(order_total(dishes) + fee, 2), t, p50, p90, p50, p90, reason=self.order.explain(load),
+                         source=self._source_of(o), fulfilment=fulfil, zone=zone, fee=fee, guest_id=o.get("guest_id"),
+                         extra_min=extra)
+        oo.check_id = self.payments.open_online(o, fee, o.get("guest_id")).check_id
         self.online.orders[oo.order_id] = oo
         self.metrics.online_orders += 1
         self.conn.execute("INSERT OR REPLACE INTO quote_log (service_id, order_id, placed_sim_ts, quoted_p50, quoted_p90) VALUES (?,?,?,?,?)",
@@ -536,6 +705,13 @@ class Service:
     def _source_of(o: dict) -> str:
         return o.get("source") or "sim"
 
+    def _quote_closed(self, o, promised_t: float) -> None:
+        within = (o.quote_p50_t - 5 * 60) <= promised_t <= (o.quote_p90_t + 30)
+        err = (promised_t - o.quote_p50_t) / 60
+        self.metrics.quotes.append({"order_id": o.order_id, "within": within, "error_min": round(err, 1), "fulfilment": o.fulfilment})
+        self.conn.execute("UPDATE quote_log SET actual_ready=?, within_range=?, error_min=? WHERE service_id=? AND order_id=?",
+                          (self.clock.iso(promised_t), int(within), round(err, 2), self.service_id, o.order_id))
+
     def _online_progress(self, t: float) -> None:
         for o in self.online.active():
             if o.status == "cooking":
@@ -543,14 +719,22 @@ class Service:
                 if its and all(i.status == "done" for i in its) and not self.orders.get(o.order_id, {}).get("held"):
                     ready = max(i.done_at for i in its) + PACK_BUFFER_MIN * 60
                     if t >= ready:
-                        o.status, o.ready_t = "ready", ready
-                        within = (o.quote_p50_t - 5 * 60) <= ready <= (o.quote_p90_t + 30)
-                        err = (ready - o.quote_p50_t) / 60
-                        self.metrics.quotes.append({"order_id": o.order_id, "within": within, "error_min": round(err, 1)})
-                        self.conn.execute("UPDATE quote_log SET actual_ready=?, within_range=?, error_min=? WHERE service_id=? AND order_id=?",
-                                          (self.clock.iso(ready), int(within), round(err, 2), self.service_id, o.order_id))
-                        o.notifications.append({"at": self.clock.hhmm(t), "text": "Your order is ready for pickup"})
+                        o.ready_t = ready
+                        if o.fulfilment == "delivery":
+                            a = self.dispatcher.assign(o.order_id, ready, o.zone)
+                            o.status, o.driver_id, o.depart_t, o.delivered_t = "out_for_delivery", a["driver_id"], a["depart_t"], a["arrive_t"]
+                            o.notifications.append({"at": self.clock.hhmm(t), "text": f"Out for delivery with {a['driver_id']}, "
+                                                    f"arriving about {self.clock.hhmm(a['arrive_t'])}"})
+                        else:
+                            o.status = "ready"
+                            self._quote_closed(o, ready)
+                            o.notifications.append({"at": self.clock.hhmm(t), "text": "Your order is ready for pickup"})
                         self.bus.publish(E.ONLINE_ORDER, self.online.view(o, self.clock), source="online")
+            elif o.status == "out_for_delivery" and o.delivered_t is not None and t >= o.delivered_t:
+                o.status = "delivered"
+                self._quote_closed(o, o.delivered_t)
+                o.notifications.append({"at": self.clock.hhmm(o.delivered_t), "text": "Delivered. Enjoy!"})
+                self.bus.publish(E.ONLINE_ORDER, self.online.view(o, self.clock), source="online")
             elif o.status == "ready" and o.ready_t is not None and t >= o.ready_t + PICKUP_AFTER_MIN * 60:
                 o.status = "picked_up"
                 self.bus.publish(E.ONLINE_ORDER, self.online.view(o, self.clock), source="online")
@@ -562,7 +746,8 @@ class Service:
                 continue
             its = [self.kitchen.items[i] for i in o.item_ids if i in self.kitchen.items]
             est = self.kitchen.estimate_items(its, t, PACK_BUFFER_MIN)
-            o.cur_p50_t, o.cur_p90_t = t + est["p50_min"] * 60, t + est["p90_min"] * 60
+            extra = self._delivery_extra(o.zone, t + est["p50_min"] * 60) if o.fulfilment == "delivery" else 0.0
+            o.cur_p50_t, o.cur_p90_t = t + (est["p50_min"] + extra) * 60, t + (est["p90_min"] + extra * 1.15) * 60
             notify = False
             ref = o.notified_p90_t or o.quote_p90_t
             if o.cur_p90_t > ref + NOTIFY_SLIP_MIN * 60 and o.override_t is None:
@@ -615,6 +800,25 @@ class Service:
         h["throttle_online"] = lambda d: self.set_online_mode(d["payload"]["mode"], d["payload"].get("reason") or d["title"])
         h["allergen_swap"] = lambda d: self.order.apply_swap(d["payload"], approved=True)
         h["comp"] = self._h_comp
+        h["add_staff"] = lambda d: {"called_in": d["payload"]["station"], "arrives_in_min": settings.CALL_IN_DELAY_MIN}
+        h["release_staff"] = lambda d: self.prep.release(d["payload"])
+        h["prep_batch"] = lambda d: self.prep.run_batch(d["payload"])
+        h["donate_lots"] = self._h_donate
+        h["price_change"] = self._h_price
+
+    def _h_donate(self, d: dict) -> dict:
+        self.flush()
+        p = d["payload"]
+        res = record_donation(self.conn, self.date, p["lots"], p["partner"])
+        self.stock.reload(p.get("ingredients") or None)
+        self.inventory_dirty = True
+        return res
+
+    def _h_price(self, d: dict) -> dict:
+        """Price changes take effect from the next service (tonight's checks keep tonight's prices)."""
+        p = d["payload"]
+        self.conn.execute("UPDATE dishes SET price=? WHERE id=?", (float(p["new_price"]), p["dish_id"]))
+        return {"dish_id": p["dish_id"], "new_price": p["new_price"], "effective": "next service"}
 
     def _h_po(self, d: dict) -> dict:
         self.flush()
@@ -686,6 +890,8 @@ class Service:
         p = d["payload"]
         self.metrics.comps += float(p["amount"])
         o = self.online.orders.get(p["order_id"])
+        if o and o.check_id:
+            self.payments.comp(o.check_id, float(p["amount"]), p.get("reason", "late order"))
         if o:
             o.notifications.append({"at": self.clock.hhmm(), "text": f"Sorry for the wait: ${p['amount']:.2f} credited"})
             self.bus.publish(E.QUOTE_UPDATED, {**self.online.view(o, self.clock), "notify": True}, source="order")
@@ -734,6 +940,64 @@ class Service:
     def quarantined_ingredients(self) -> set[str]:
         return {i for i, ls in self.stock.lots.items() for l in ls if l["lot_id"] in self.stock.quarantine}
 
+    # ================================================================== analytics / suppliers / reports
+    def supplier_scorecard(self) -> list[dict]:
+        self.flush()
+        rows = SUPL.scorecard(self.conn)
+        R.clear_cache()
+        return rows
+
+    def learn_supplier(self, supplier_id: str, kind: str, fill: float | None = None, late: bool | None = None, note: str = "") -> dict:
+        self.flush()
+        res = SUPL.observe(self.conn, supplier_id, self.clock.iso(), kind, fill, late, weight=2.0, note=note)
+        R.clear_cache()
+        return res
+
+    def tonight_sales(self) -> dict[str, int]:
+        out: dict[str, int] = {}
+        for o in self.orders.values():
+            for i in o["items"]:
+                out[i["dish_id"]] = out.get(i["dish_id"], 0) + 1
+        return out
+
+    def menu_engineering(self, days: int = 28) -> dict:
+        self.flush()
+        return ME.analyze(self.conn, self.date, days, self.tonight_sales())
+
+    def waste(self, days: int = 30) -> dict:
+        self.flush()
+        return waste_analytics(self.conn, self.date, days)
+
+    def kpis(self) -> dict:
+        k = self.metrics.kpis(self.forecast)
+        k.update({f"pay_{key}": v for key, v in self.payments.summary().items()})
+        k["surge_labor"] = round(self.prep.surge_spent, 2) if hasattr(self, "prep") else 0.0
+        k["scratch_items"] = self.prep.scratch_items if hasattr(self, "prep") else 0
+        k["waitlist"] = len(self.floor.waitlist)
+        k["no_shows"] = sum(1 for b in self.host.bookings.values() if b.status == "no_show")
+        dq = [q for q in self.metrics.quotes if q.get("fulfilment") == "delivery"]
+        k["delivery_accuracy_pct"] = round(100 * sum(q["within"] for q in dq) / len(dq), 1) if dq else None
+        return k
+
+    def report(self) -> dict:
+        """End-of-service report: KPIs, payments, decisions, waste, forecast error, menu mix."""
+        ds = list(self.coordinator.decisions.values())
+        by_status: dict[str, int] = {}
+        for d in ds:
+            by_status[d["status"]] = by_status.get(d["status"], 0) + 1
+        sales = self.tonight_sales()
+        return {"service": self.info(), "generated": E.wall_now(), "kpis": self.kpis(), "payments": self.payments.summary(),
+                "forecast": {"base": self.forecast.base, "revised": self.forecast.revised,
+                             "error": getattr(self, "forecast_error", None)},
+                "decisions": {"by_status": by_status,
+                              "items": [{k: d.get(k) for k in ("id", "created_sim", "agent", "action_type", "title", "status", "note")}
+                                        for d in ds]},
+                "sales_by_dish": sorted(({"dish_id": k, "name": cat.DISHES_BY_ID[k].name, "qty": v,
+                                          "sales": round(v * cat.DISHES_BY_ID[k].price, 2)} for k, v in sales.items()),
+                                        key=lambda x: -x["sales"]),
+                "waste": self.waste(1), "staffing": self.prep.view(), "bookings": self.host.bookings_view(),
+                "safety": {"checklist": self.safety.checklist(), "alerts": self.safety.alerts}}
+
     def inject(self, name: str) -> dict:
         res = SC.inject(self, name)
         self.flush()
@@ -750,7 +1014,8 @@ class Service:
                 "period": self.period, "start": self.clock.start.isoformat(timespec="minutes"),
                 "end": self.clock.end.isoformat(timespec="minutes"), "seed": self.seed, "bus": self.bus.kind,
                 "llm_mode": "mock" if llm.is_mock() else llm.describe(), "status": self.status,
-                "approval_timeout_s": settings.APPROVAL_TIMEOUT_S, "po_threshold": settings.LIVE_PO_APPROVAL_THRESHOLD,
+                "approval_timeout_min": settings.APPROVAL_TIMEOUT_SIM_MIN, "po_threshold": settings.LIVE_PO_APPROVAL_THRESHOLD,
+                "auth_enabled": settings.AUTH_ENABLED,
                 "reservations": len(self.guests.bookings), "booked_covers": self.guests.booked_covers}
 
     def clock_view(self) -> dict:
@@ -777,14 +1042,19 @@ class Service:
                 "online": {"mode": self.online.mode, "reason": self.online.mode_reason,
                            "orders": {o.order_id: self.online.view(o, self.clock) for o in self.online.orders.values()}},
                 "decisions": {str(d["id"]): self.coordinator.view(d) for d in self.coordinator.decisions.values()},
-                "kpis": self.metrics.kpis(self.forecast), "feed": list(self.feed), "dishes": DISH_VIEW,
+                "kpis": self.kpis(), "feed": list(self.feed), "dishes": DISH_VIEW,
+                "host": {"bookings": self.host.bookings_view(), "waitlist": self.host.waitlist_view()},
+                "checks": {c.check_id: self.payments.view(c) for c in self.payments.checks.values()
+                           if c.status == "open" or (self.clock.t - (c.closed_t or 0)) < 30 * 60},
+                "prep": self.prep.view(), "safety": self.safety.view(), "drivers": self.dispatcher.view(self.clock.t),
+                "zones": settings.DELIVERY_ZONES,
                 "scenarios": [{"name": k, "label": v[1]} for k, v in SC.SCENARIOS.items()]}
 
     def _publish_state(self) -> None:
         self.bus.publish(E.KITCHEN_LOAD, self.kitchen_load(), source="kitchen")
         self.bus.publish(E.INVENTORY_SNAPSHOT, self.inventory_view(), source="inventory")
         self.bus.publish(E.MENU_UPDATED, self.menu.snapshot(), source="menu")
-        self.bus.publish(E.KPI_UPDATED, self.metrics.kpis(self.forecast), source="service")
+        self.bus.publish(E.KPI_UPDATED, self.kpis(), source="service")
         self.bus.publish(E.CLOCK_TICK, self.clock_view(), source="clock")
 
     def _to_feed(self, ev: E.Event) -> None:

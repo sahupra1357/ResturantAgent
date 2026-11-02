@@ -11,6 +11,10 @@ export default function OnlinePage({ state, standalone = false }) {
   const [mine, setMine] = useState(() => { try { return JSON.parse(localStorage.getItem('ro-my-orders') || '[]') } catch { return [] } })
   const [error, setError] = useState('')
   const [name, setName] = useState('')
+  const [phone, setPhone] = useState('')
+  const [fulfilment, setFulfilment] = useState('pickup')
+  const [zone, setZone] = useState('A')
+  const zones = state.zones || {}
   const mode = state.online?.mode || 'open'
   const avail = useMemo(() => availability(state), [state.inventory, state.menu])
   const out86 = new Set((state.menu?.eighty_sixed || []).map((x) => x.dish_id))
@@ -25,9 +29,9 @@ export default function OnlinePage({ state, standalone = false }) {
   useEffect(() => {
     if (!ids.length) { setQuote(null); return }
     clearTimeout(timer.current)
-    timer.current = setTimeout(() => api.quote(ids).then(setQuote).catch(() => {}), 250)
+    timer.current = setTimeout(() => api.quote(ids, fulfilment, fulfilment === 'delivery' ? zone : null).then(setQuote).catch(() => {}), 250)
     return () => clearTimeout(timer.current)
-  }, [key, state.kitchen?.score, state.clock?.hhmm])
+  }, [key, state.kitchen?.score, state.clock?.hhmm, fulfilment, zone])
 
   useEffect(() => { try { localStorage.setItem('ro-my-orders', JSON.stringify(mine.slice(-6))) } catch { /* private mode */ } }, [mine])
 
@@ -39,11 +43,15 @@ export default function OnlinePage({ state, standalone = false }) {
   const checkout = async () => {
     setError('')
     try {
-      const r = await api.onlineOrder({ items: Object.entries(cart).filter(([, n]) => n > 0).map(([dish_id, qty]) => ({ dish_id, qty })), customer: name || 'Web guest' })
+      const r = await api.onlineOrder({
+        items: Object.entries(cart).filter(([, n]) => n > 0).map(([dish_id, qty]) => ({ dish_id, qty })),
+        customer: name || 'Web guest', phone, fulfilment, zone: fulfilment === 'delivery' ? zone : null,
+      })
       setMine([...mine, r.order_id]); setCart({})
     } catch (e) { setError(e.message) }
   }
-  const total = ids.reduce((a, id) => a + (state.dishes?.[id]?.price || 0), 0)
+  const fee = fulfilment === 'delivery' ? zones[zone]?.fee || 0 : 0
+  const total = ids.reduce((a, id) => a + (state.dishes?.[id]?.price || 0), 0) + fee
   const orders = mine.map((id) => state.online?.orders?.[id]).filter(Boolean).reverse()
 
   return (
@@ -85,10 +93,21 @@ export default function OnlinePage({ state, standalone = false }) {
             {!ids.length && <p className="muted">Add something to see a ready time.</p>}
             {ids.length > 0 && (
               <>
-                <div className="quote-big">ready {quote ? `${quote.range_hhmm[0]}–${quote.range_hhmm[1]}` : '…'}</div>
-                {quote && <p className="muted small">{quote.explanation}</p>}
-                <input placeholder="Name for pickup" value={name} onChange={(e) => setName(e.target.value)} />
-                <button className="primary" onClick={checkout} disabled={mode === 'paused'}>Place order · ${total.toFixed(2)}</button>
+                <div className="seg" role="radiogroup" aria-label="Pickup or delivery">
+                  {['pickup', 'delivery'].map((f) => (
+                    <button key={f} role="radio" aria-checked={fulfilment === f} className={fulfilment === f ? 'on' : ''} onClick={() => setFulfilment(f)}>{f}</button>
+                  ))}
+                </div>
+                {fulfilment === 'delivery' && (
+                  <select aria-label="Delivery zone" value={zone} onChange={(e) => setZone(e.target.value)}>
+                    {Object.entries(zones).map(([z, info]) => <option key={z} value={z}>Zone {z} · {info.label} · ${info.fee.toFixed(2)}</option>)}
+                  </select>
+                )}
+                <div className="quote-big">{fulfilment === 'delivery' ? 'at your door' : 'ready'} {quote ? `${quote.range_hhmm[0]}–${quote.range_hhmm[1]}` : '…'}</div>
+                {quote && <p className="muted small">{quote.explanation}{fulfilment === 'delivery' && quote.delivery_min ? ` · ${Math.round(quote.delivery_min)} min driver + drive` : ''}</p>}
+                <input aria-label="Name" placeholder="Name" value={name} onChange={(e) => setName(e.target.value)} />
+                <input aria-label="Phone" placeholder="Phone (saves your allergies and points)" value={phone} onChange={(e) => setPhone(e.target.value)} />
+                <button className="primary" onClick={checkout} disabled={mode === 'paused'}>Place order · ${total.toFixed(2)}{fee ? ' incl. delivery' : ''} + tax</button>
               </>
             )}
             {error && <p className="err">{error}</p>}
@@ -96,7 +115,8 @@ export default function OnlinePage({ state, standalone = false }) {
           {orders.map((o) => (
             <div key={o.order_id} className={`track ${o.late ? 'late' : ''} ${o.status}`}>
               <div className="track-head"><b>{o.order_id}</b><span className="pill">{o.status.replace('_', ' ')}</span></div>
-              <div className="quote-big">{o.status === 'cooking' ? `${o.current_hhmm[0]}–${o.current_hhmm[1]}` : o.status === 'ready' ? 'Ready!' : 'Picked up'}</div>
+              <div className="quote-big">{o.status === 'cooking' ? `${o.current_hhmm[0]}–${o.current_hhmm[1]}` : o.status === 'ready' ? 'Ready!'
+                : o.status === 'out_for_delivery' ? `On the way · ${o.eta_hhmm}` : o.status === 'delivered' ? 'Delivered' : 'Picked up'}</div>
               <p className="muted small">quoted {o.quoted_hhmm[0]}–{o.quoted_hhmm[1]}{o.late ? ` · ${o.late_by_min} min late` : ''}</p>
               <ul className="notes">{o.notifications.slice().reverse().map((n, i) => <li key={i}><b>{n.at}</b> {n.text}</li>)}</ul>
             </div>

@@ -17,8 +17,7 @@ from restaurant_ops.live import events as E
 from restaurant_ops.live.agents.base import LiveAgent
 from restaurant_ops.live.menu_live import LAST_N
 
-LOW_DEBOUNCE_MIN = 30.0
-EXPIRY_MIN_VALUE = 20.0
+# tunables in config.Settings: LOW_DEBOUNCE_MIN, EXPIRY_MIN_VALUE, EXPIRY_ALERT_DAYS
 
 
 class InventoryAgent(LiveAgent):
@@ -31,6 +30,9 @@ class InventoryAgent(LiveAgent):
         svc.bus.subscribe(E.ITEM_FIRED, self.on_fired, "inventory.on_fired")
         svc.bus.subscribe(E.FORECAST_UPDATED, self.on_forecast, "inventory.on_forecast")
         svc.bus.subscribe(E.SUPPLIER_SHORTFALL, self.on_shortfall, "inventory.on_shortfall")
+        svc.bus.subscribe(E.TEMP_ALERT, self.on_temp_alert, "inventory.on_temp_alert")
+        self.cooler_handled = False
+        self.donation_done = False
 
     # ------------------------------------------------------------------ hot path
     def on_fired(self, ev: E.Event) -> None:
@@ -64,7 +66,7 @@ class InventoryAgent(LiveAgent):
                 continue
             ing = svc.stock.limiting(d)
             prev = self.low_sent.get(ing)
-            if prev and not force and (t_min - prev["t"] < LOW_DEBOUNCE_MIN and left > prev["remaining"] / 2):
+            if prev and not force and (t_min - prev["t"] < settings.LOW_DEBOUNCE_MIN and left > prev["remaining"] / 2):
                 continue
             self.low_sent[ing] = {"t": t_min, "remaining": left}
             ev = {"ingredient_id": ing, "ingredient": cat.INGREDIENTS_BY_ID[ing].name, "dish_id": d,
@@ -86,10 +88,10 @@ class InventoryAgent(LiveAgent):
     # ------------------------------------------------------------------ sweeps
     def sweep_expiry(self) -> list[dict]:
         trace: list = []
-        lots = self.tool(trace, "expiry_risk", within_days=1)
+        lots = self.tool(trace, "expiry_risk", within_days=settings.EXPIRY_ALERT_DAYS)
         out = []
         for l in lots:
-            if l["lot_id"] in self.expiry_sent or l["value"] < EXPIRY_MIN_VALUE or l["quarantined"]:
+            if l["lot_id"] in self.expiry_sent or l["value"] < settings.EXPIRY_MIN_VALUE or l["quarantined"]:
                 continue
             self.expiry_sent.add(l["lot_id"])
             l = {**l, "ingredient": cat.INGREDIENTS_BY_ID[l["ingredient_id"]].name,
@@ -110,7 +112,7 @@ class InventoryAgent(LiveAgent):
         self.sweep_expiry()
 
     # ------------------------------------------------------------------ cooler failure
-    def cooler_failure(self, category: str = "dairy") -> dict:
+    def cooler_failure(self, category: str = "dairy", reason: str = "walk-in cooler failure") -> dict:
         svc, trace = self.svc, []
         lots = [l for l in svc.stock.lots_where(category=category, storage="cooler")]
         trace.append({"tool": "stock_by_lot", "args": {"category": category, "storage": "cooler"},
@@ -120,12 +122,12 @@ class InventoryAgent(LiveAgent):
         svc.inventory_dirty = True
         value = round(sum(l["value"] for l in lots), 2)
         ings = sorted({l["ingredient_id"] for l in lots})
-        svc.bus.publish(E.LOT_QUARANTINED, {"lots": lots, "ingredients": ings, "value": value, "reason": "walk-in cooler failure"},
+        svc.bus.publish(E.LOT_QUARANTINED, {"lots": lots, "ingredients": ings, "value": value, "reason": reason},
                         source=self.name)
         self.submit([self.proposal(
             "discard_lots", {"lots": [{"lot_id": i, "reason": "spoilage"} for i in ids], "value": value, "ingredients": ings},
             f"Discard {len(ids)} {category} lots (${value:.2f}): walk-in cooler failed",
-            f"{len(ids)} {category} lots held above safe temperature are quarantined; food safety requires discarding them",
+            f"{reason}: {len(ids)} {category} lots held above safe temperature are quarantined; food safety requires discarding them",
             trace, key=f"discard:cooler:{category}", confidence=0.95, timeout_default="approve", est_cost=value)])
         return {"quarantined": len(ids), "value": value, "ingredients": ings}
 
@@ -136,9 +138,39 @@ class InventoryAgent(LiveAgent):
             self.svc.inventory_dirty = True
             self.log(f"manager kept {len(ids)} quarantined lots ('{d.get('note')}'); back in stock")
 
+    def on_temp_alert(self, ev: E.Event) -> None:
+        """A walk-in cooler reading out of range: quarantine its dairy at once and ask to discard (food safety)."""
+        if ev.payload["unit"] == "walk_in" and not self.cooler_handled:
+            self.cooler_handled = True
+            self.cooler_failure("dairy", reason=ev.payload["message"])
+
+    def propose_donations(self) -> None:
+        """Late in service: lots that expire today, are safe (not quarantined) and won't be used go to a food bank."""
+        svc, trace = self.svc, []
+        rem = svc.forecast.dish_remaining(svc.clock.t / 60)
+        lots = [l for l in self.tool(trace, "expiry_risk", within_days=0) if l["days_left"] == 0 and not l["quarantined"]]
+        give = []
+        for l in lots:
+            still = sum(n * svc.stock.bom[d].get(l["ingredient_id"], 0.0) for d, n in rem.items())
+            if still < 0.25 * l["qty"] and l["value"] >= settings.DONATION_MIN_VALUE:
+                give.append(l)
+        if not give:
+            return
+        value = round(sum(l["value"] for l in give), 2)
+        self.submit([self.proposal(
+            "donate_lots", {"lots": [{"lot_id": l["lot_id"]} for l in give], "partner": "City Food Bank", "value": value,
+                            "ingredients": sorted({l["ingredient_id"] for l in give})},
+            f"Donate {len(give)} lots expiring today (${value:.2f}) instead of binning them",
+            "safe stock that expires tonight and is not needed for the rest of service; a donation is not waste",
+            trace, key="donate:end", confidence=0.8, timeout_default="reject", est_cost=value)])
+
     def on_tick(self, t_min: float) -> None:
         if int(t_min) % 60 == 0 and t_min > 0:
             self.sweep_expiry()
+        end_min = (self.svc.clock.end - self.svc.clock.start).total_seconds() / 60
+        if not self.donation_done and t_min >= end_min - 45:
+            self.donation_done = True
+            self.propose_donations()
 
 
 def discard_needs_approval(value: float) -> bool:

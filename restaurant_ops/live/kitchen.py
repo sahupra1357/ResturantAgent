@@ -56,6 +56,7 @@ class Item:
     done_at: float | None = None
     mods: list[str] = field(default_factory=list)
     large_party: bool = False
+    scratch: bool = False        # nothing prepped: cooked from scratch (slower)
 
 
 @dataclass
@@ -85,10 +86,33 @@ class Kitchen:
         self.scheduled: list[Item] = []                      # course timing: fired later
         self.items: dict[str, Item] = {}
         self.done_log: list[Item] = []
+        self.fire_hook = None   # fn(Item) -> cook-time factor at fire (prep burn-down: 1.0 prepped, >1 from scratch)
+        self.scratch_check = None  # fn(dish_id) -> factor used by estimates for items not yet fired
+
+    def __getstate__(self):
+        return {k: v for k, v in self.__dict__.items() if k not in ("fire_hook", "scratch_check")}
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self.fire_hook = self.scratch_check = None
+
+    def set_cooks(self, station: str, cooks: int, now: float) -> dict:
+        """Change a station's cooks mid-service (call-in / release). Slots are added free now, or idle ones removed."""
+        st = self.stations[station]
+        cooks = max(1, int(cooks))
+        new_slots = cooks * st.parallel
+        diff = new_slots - len(st.slots_free_at)
+        if diff > 0:
+            st.slots_free_at += [now] * diff
+        elif diff < 0:
+            st.slots_free_at = sorted(st.slots_free_at)[-diff:]  # the cook who leaves finishes nothing new
+        st.cooks = cooks
+        return {"station": station, "cooks": cooks, "slots": st.slots}
 
     # ------------------------------------------------------------------ estimates
     def est_minutes(self, dish_id: str) -> float:
-        return cook_minutes(dish_id) * self.cal[cat.DISHES_BY_ID[dish_id].station]
+        f = self.scratch_check(dish_id) if self.scratch_check else 1.0
+        return cook_minutes(dish_id) * self.cal[cat.DISHES_BY_ID[dish_id].station] * f
 
     def k90(self, station: str) -> float:
         r = self.ratios[station]
@@ -189,7 +213,10 @@ class Kitchen:
         for it in due:
             self.scheduled.remove(it)
             it.status = "queued"
-            it.est_min = round(self.est_minutes(it.dish_id), 2)
+            f = self.fire_hook(it) if self.fire_hook else 1.0
+            it.actual_min = round(it.actual_min * f, 2)
+            it.est_min = round(cook_minutes(it.dish_id) * self.cal[it.station] * f, 2)
+            it.scratch = f > 1.0
             self.stations[it.station].queue.append(it)
             fired.append(it)
         for st in self.stations.values():
@@ -220,6 +247,9 @@ class Kitchen:
         return {"fired": fired, "started": started, "done": done}
 
     def _learn(self, it: Item) -> None:
+        if it.scratch:
+            self.done_log.append(it)
+            return  # scratch cooking is explained by the missing prep, not by the station's pace
         nominal = cook_minutes(it.dish_id)
         ratio = it.actual_min / nominal
         self.ratios[it.station].append(ratio)
