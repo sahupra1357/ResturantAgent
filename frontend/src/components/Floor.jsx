@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { STATE_LABEL, STATION_LABEL } from '../format.js'
+import { colorForParty } from '../floor3d.js'
 import OrderDialog from './OrderDialog.jsx'
 
 const STATE_ORDER = ['available', 'seated', 'ordered', 'entrees_fired', 'eating', 'check', 'bussing']
@@ -28,26 +29,65 @@ function TableShape({ t, clockT, onClick, selected }) {
   )
 }
 
+export const shortReason = (r = '') => (r.startsWith('early') ? r.replace('early for ', 'for ') : r.includes('rest of') ? 'party due' : 'check-in')
+
+// Waiting parties drawn in the lobby: one dot per guest (party colour), name, size and wait.
+export function lobbySlots(lobby, waitlist) {
+  if (!lobby) return []
+  const out = []
+  const pad = 10
+  const colW = 112
+  const rowH = 30
+  const cols = Math.max(1, Math.floor((lobby.w - pad * 2) / colW))
+  const rows = Math.max(1, Math.floor((lobby.h - 28) / rowH))
+  ;(waitlist || []).slice(0, cols * rows).forEach((w, i) => {
+    const col = i % cols
+    const row = Math.floor(i / cols)
+    out.push({ w, x: lobby.x + lobby.w - pad - (col + 1) * colW + 6, y: lobby.y + 26 + row * rowH })
+  })
+  return { slots: out, hidden: Math.max(0, (waitlist || []).length - cols * rows) }
+}
+
 export default function Floor({ state }) {
   const [sel, setSel] = useState(null)
   const tables = Object.values(state.tables || {})
   const fx = state.layout?.fixtures || {}
+  const W = state.layout?.width || 1000
+  const Hh = state.layout?.height || 700
   const clockT = state.clock?.t || 0
   const counts = STATE_ORDER.map((s) => [s, tables.filter((t) => t.state === s).length])
+  const waitlist = state.host?.waitlist || []
+  const lobby = Object.values(fx).find((f) => f.kind === 'zone')
+  const { slots = [], hidden = 0 } = lobbySlots(lobby, waitlist) || {}
   return (
     <div className="floor">
-      <svg viewBox="0 0 1000 620" className="floor-svg" aria-label="Dining floor">
-        <rect x="10" y="10" width="980" height="600" rx="14" className="room" />
+      <svg viewBox={`0 0 ${W} ${Hh}`} className="floor-svg" aria-label="Dining floor">
+        <rect x="10" y="10" width={W - 20} height={Hh - 20} rx="14" className="room" />
         {Object.entries(fx).map(([k, f]) => (
-          <g key={k} className={`fixture fx-${k}`}>
-            <rect x={f.x} y={f.y} width={f.w} height={f.h} rx="6" />
-            <text x={f.x + f.w / 2} y={f.y + f.h / 2 + 4}>{f.label}</text>
+          <g key={k} className={`fixture fx-${k} fk-${f.kind || 'solid'}`}>
+            <rect x={f.x} y={f.y} width={f.w} height={f.h} rx={f.kind === 'door' ? 2 : 6} />
+            {f.kind === 'zone'
+              ? <text x={f.x + 10} y={f.y + 16} className="zone-label">{f.label} · {waitlist.length} {waitlist.length === 1 ? 'party' : 'parties'}</text>
+              : f.kind === 'door'
+                ? <text x={f.x - 6} y={f.y + f.h / 2} className="door-label" transform={`rotate(-90 ${f.x - 6} ${f.y + f.h / 2})`}>{f.label}</text>
+                : <text x={f.x + f.w / 2} y={f.y + f.h / 2 + 4}>{f.label}</text>}
           </g>
         ))}
         <text x="24" y="30" className="zone">Window</text>
         {tables.map((t) => (
           <TableShape key={t.id} t={t} clockT={clockT} onClick={setSel} selected={sel?.id === t.id} />
         ))}
+        {slots.map(({ w, x, y }) => (
+          <g key={w.party_id} className={`waiting${w.checking_in ? ' checking' : ''}`}>
+            <title>{`${w.name}: party of ${w.size}, ${w.checking_in ? w.reason || 'checking in' : `waited ${w.waited_min} min for a table`}`}</title>
+            {Array.from({ length: Math.min(w.size, 8) }, (_, i) => (
+              <circle key={i} cx={x + 5 + i * 7} cy={y + 4} r={3.4} style={{ fill: colorForParty(w.party_id) }} />
+            ))}
+            <text x={x} y={y + 19} className="wname">{String(w.name).slice(0, 13)} · {w.size}</text>
+            <text x={x + 104} y={y + 7} className="wmeta">{w.checking_in ? shortReason(w.reason) : `${w.waited_min}m`}</text>
+          </g>
+        ))}
+        {hidden > 0 && lobby && <text x={lobby.x + 10} y={lobby.y + lobby.h - 6} className="wmeta">+{hidden} more waiting</text>}
       </svg>
       <div className="legend">
         {counts.map(([s, n]) => (

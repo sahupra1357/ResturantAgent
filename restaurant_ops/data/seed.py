@@ -44,6 +44,9 @@ def main(argv: list[str] | None = None) -> int:
     conn = get_conn(args.db)
     init_db(conn)
     cat_counts = load_catalog(conn)
+    from restaurant_ops.admin import seed_defaults
+
+    seed_defaults(conn)
     gen = generate_all(conn)
     conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('sim_start', ?)", (settings.SIM_START.isoformat(),))
     conn.commit()

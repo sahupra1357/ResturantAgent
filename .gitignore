@@ -13,3 +13,10 @@ data/runs/
 data/live/
 # retired Streamlit UI (leftover __pycache__ only)
 ui/
+data/backups/
+data/exports/
+data/outbox/
+data/printer/
+data/evals/
+data/FIRST_RUN_ADMIN.txt
+dump.rdb

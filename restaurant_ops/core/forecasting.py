@@ -227,11 +227,21 @@ class _ShareModel:
         return np.clip(raw, 0.0, None)
 
 
+def refresh_catalog() -> None:
+    """Rebuild the dish lists after the catalog changed (admin edits). New dishes get indices after the old ones,
+    so a model trained before the change still scores them (with little history until it is retrained)."""
+    global DISH_IDS, _DISH_IDX, _INSEASON
+    DISH_IDS = DISH_IDS + [d.id for d in cat.DISHES if d.id not in _DISH_IDX]  # retired dishes keep their index
+    _DISH_IDX = {d: i for i, d in enumerate(DISH_IDS)}
+    _INSEASON = {(d.id, m): float(cat.in_season(d.seasonal_months, m)) for d in cat.DISHES for m in range(1, 13)}
+
+
 def _expand_dishes(feats: pd.DataFrame) -> pd.DataFrame:
     """Cross-join feature rows with the 20 dishes and add dish attributes."""
-    dd = pd.DataFrame({"dish_id": DISH_IDS, "dish_idx": [float(i) for i in range(len(DISH_IDS))],
-                       "dish_cold": [float(cat.DISHES_BY_ID[d].is_cold) for d in DISH_IDS],
-                       "dish_cat": [float(_CAT_CODE[cat.DISHES_BY_ID[d].category]) for d in DISH_IDS]})
+    ids = [d for d in DISH_IDS if d in cat.DISHES_BY_ID]  # active dishes only, with stable model indices
+    dd = pd.DataFrame({"dish_id": ids, "dish_idx": [float(_DISH_IDX[d]) for d in ids],
+                       "dish_cold": [float(cat.DISHES_BY_ID[d].is_cold) for d in ids],
+                       "dish_cat": [float(_CAT_CODE[cat.DISHES_BY_ID[d].category]) for d in ids]})
     D = feats.merge(dd, how="cross")
     D["in_season"] = [_INSEASON[(d, int(m))] for d, m in zip(D["dish_id"], D["month"])]
     return D
@@ -355,7 +365,7 @@ def _compute_signals(feats: pd.DataFrame, D: pd.DataFrame, covers_m: _QuantileMo
     train = feats[feats["date"] < test_start]
     train_booked = train.groupby("period")["booked_covers"].mean().to_dict()
     test = feats[feats["date"] >= test_start].reset_index(drop=True)
-    cold_idx = {i for i, d in enumerate(DISH_IDS) if cat.DISHES_BY_ID[d].is_cold}
+    cold_idx = {i for i, d in enumerate(DISH_IDS) if d in cat.DISHES_BY_ID and cat.DISHES_BY_ID[d].is_cold}
     out = []
 
     def covers_mae(X: pd.DataFrame) -> float:

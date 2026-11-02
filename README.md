@@ -142,18 +142,22 @@ redis-server --daemonize yes
    ```bash
    uv run python -m restaurant_ops.live.server
    ```
-   A dinner service starts right away at 10x. The floor opens in **3D**: guests walk in through the door, sit at
-   their tables, wait by the host stand when no table fits, and leave when they've paid. Drag to rotate, scroll to
+   Sign in (see below). A dinner service starts right away at 10x. The floor fills the screen (**Side by side** puts
+   the dashboard next to it) and opens in **3D**. Guests walk in through the entrance and wait in the waiting area
+   while they check in with the host. A party that is early for its booking, waiting for the rest of its group, or
+   has no free table also waits there, and each waiting party has a name tag. Guests then sit at their tables and
+   leave when they've paid. Drag to rotate, scroll to
    zoom, and click a table to order (the 2D floor is a tab). Sign in as manager to use the controls. Use the clock
    buttons for pause, 1x, 10x or 60x. **New service**
    starts a fresh seeded dinner. The disruption buttons inject a party of 12, salmon short, cooler failure,
    heatwave or forecast miss. Click a table to place an order by hand. **Online page ↗** opens the customer page
    (`/#/online`), with pickup or delivery by zone. **Replay…** plays back any logged service from its event log.
-   The dashboard has four tabs:
+   The dashboard has five tabs:
    - **Operations:** approvals, kitchen, decision feed, online orders, KPIs.
    - **Front of house:** bookings, waitlist, table moves, checks, guests.
    - **Kitchen & safety:** prep and staffing, HACCP and temperatures, inventory, waste.
-   - **Insights:** forecast, end-of-service report, menu engineering, supplier reliability, baseline.
+   - **Insights:** forecast, end-of-service report, menu engineering, supplier reliability, baseline, LLM pilot.
+   - **Back office** (manager): day close, gift cards, purchase orders, backups and drill, LLM pilot, audit log.
 
    **Alerts** sounds a chime and shows a desktop notification for new approvals.
 
@@ -191,19 +195,134 @@ redis-server --daemonize yes
    uv run python -m restaurant_ops.live.ops --dry-run
    ```
 
-### Roles and sign-in
+### Sign-in, roles and audit
 
-Changes go through role tokens. Use **Sign in** in the top bar, or send `Authorization: Bearer <token>` to the API.
-The demo tokens are in config and `.env.example`; change them anywhere else.
+Everyone signs in with a named account. The browser gets an HttpOnly, SameSite=Strict session cookie, and scripts
+use `Authorization: Bearer <token>` (from `POST /api/auth/login`). Tokens never go in URLs. Cookie-authenticated
+writes also need the `X-Requested-With: ro-ui` header, which the UI sends. Everything needs a signed-in user except
+`/api/health`, the customer online-order endpoints and `/ws/public` (menu availability, kitchen busyness and order
+progress, with no names or tables).
+
+On first start the server creates an `admin` account. Its password comes from `ADMIN_PASSWORD`, or is generated and
+written to `data/FIRST_RUN_ADMIN.txt` (mode 600; change it in Setup → Users, then delete the file). With
+`DEMO_USERS=true` (the default) it also creates `manager` / `manager-demo`, `server` / `server-demo` and
+`kitchen` / `kitchen-demo`. Turn that off anywhere real.
 
 | Role | Can |
 | --- | --- |
-| manager (`MANAGER_TOKEN`) | Everything: approvals, scenarios, clock, online mode, quote overrides, discounts, refunds, overbooking, reports |
-| server (`SERVER_TOKEN`) | Table orders, bookings, waitlist, table moves, checks and payments, guest profiles |
-| kitchen (`KITCHEN_TOKEN`) | HACCP checklist, temperature log, ticket list |
+| admin | Everything, plus Setup (menu, recipes, tables, taxes, hours, stations, zones, suppliers, staff), users, imports, restore |
+| manager | Approvals, scenarios, clock, new service (period and date), online mode and quote overrides, refunds, discounts up to the manager cap, gift cards, day close, backups and drill, reports, audit log, roster |
+| server | Table orders, bookings, waitlist, table moves, checks and payments, discounts up to the server cap, guest profiles |
+| kitchen | Kitchen display (bump tickets), HACCP checklist, temperature log |
 
-Reads, the public online-order page and the WebSocket stay open. `AUTH_ENABLED=false` turns the check off for a
-local demo.
+Passwords are PBKDF2-hashed, and only hashes of session tokens are stored. Five failed logins lock the username for
+5 minutes. A password change, deactivation or role change signs that user out everywhere, and the last admin
+can't be demoted or deactivated. Every write, including refused ones and failed logins, is in the audit log
+(Back office → Audit log, or `/api/admin/audit`), with passwords never recorded. `AUTH_ENABLED=false` turns
+sign-in off for a local demo.
+
+### Setup (admin)
+
+**Setup** (`/#/admin`) edits the restaurant without touching code:
+- **Restaurant profile:** name, address, loyalty earn and point value, discount caps per role, overbooking factor.
+- **Tax rules:** several jurisdictions, each applying to food, alcohol, delivery fees or all, on any channel.
+- **Opening hours:** per weekday and meal period. A closed period can't be started.
+- **Tables:** position and size on the 1000 x 700 plan, with shape and section.
+- **Kitchen stations:** items per cook, cook-time factor and cooks per period.
+- **Delivery zones:** fee, drive time and minimum order.
+- **Ingredients**, and **dishes with recipes**, showing food cost and food-cost % live.
+- **Suppliers:** with PO e-mail and a price list.
+- **Staff and a roster:** rostered cooks set each station's capacity for that shift.
+- **Users.**
+
+Edits are validated (for example, a price below the recipe's food cost is refused, and a station that active dishes
+use can't be deleted). They are saved to the master database and **apply from the next service**, so a running
+dinner never changes under the kitchen. **Import** takes CSV for a menu with recipes, inventory counts or deliveries
+(as lots), and POS history, and each has a dry run. The same importers are on the command line:
+
+```bash
+uv run python -m restaurant_ops.data.importer menu.csv --kind menu --dry-run
+```
+
+```bash
+uv run python -m restaurant_ops.data.importer stock.csv --kind inventory --as-of 2026-11-02 --replace-stock
+```
+
+### Payments, gift cards, purchase orders, kitchen output
+
+- **Card payments** go through a processor adapter. The default is `PAYMENT_PROCESSOR=simulated`, which declines
+  token `tok_decline` and amounts over $5,000. `PAYMENT_PROCESSOR=stripe` with `STRIPE_SECRET_KEY` charges through
+  Stripe PaymentIntents (with idempotency keys) and refunds against the original charge. The processor reference is
+  stored with each payment.
+- **Gift cards** can be issued, checked, redeemed and voided, with a ledger. **Loyalty points** can pay too, at the
+  profile's point value.
+- **Purchase orders** that the agents place (and you approve) are rendered as a PDF and e-mailed to the supplier
+  over SMTP (`SMTP_HOST`, etc.). Without SMTP they wait in `data/outbox/` as PDF + .eml. You can view or resend
+  them in Back office.
+- **Kitchen chits** print per station when an order is routed. `PRINTER_MODE=file` writes them to
+  `data/printer/<service>/<station>.txt`, and `PRINTER_MODE=tcp` sends ESC/POS to a network printer
+  (`PRINTER_HOST`, or `PRINTER_HOST_<STATION>` per station; port 9100).
+- **Kitchen display** (`/#/kds`) shows tickets by station, oldest first. A ticket turns red after
+  `KDS_LATE_MIN`, and **Bump** clears it.
+
+### Day close, backups, offline capture
+
+- **Day close** (Back office) reconciles the shift:
+  - checks due against money collected by method
+  - tips, discounts and comps, refunds
+  - gift-card and points redemptions
+  - tax per jurisdiction
+  - expected cash against your drawer count (over / short)
+
+  It writes a balanced double-entry journal (`data/exports/<date>-<period>/journal.csv`) and `summary.json`. Open
+  checks block the close unless you force it.
+- **Backups:** **Back up now** and `python -m restaurant_ops.live.ops backup` take consistent SQLite copies of the
+  master database and the service databases, snapshots and checkpoints, with a SHA-256 manifest. The newest
+  `BACKUP_KEEP` are kept. **Run restore drill** (`ops drill`) restores the latest backup into a scratch folder,
+  integrity-checks every database and loads the newest snapshot. Admins can restore from the UI or with
+  `ops restore <id>`.
+- **Snapshots** are versioned and migrated on load. Each has a checksum, and the last `SNAPSHOT_KEEP` are kept. If
+  the newest snapshot is damaged, the server loads an older one. If none is readable, it rebuilds the service from
+  its database and event log, and pending approvals stay pending.
+- **Offline order capture:** when the server can't be reached, a table order is saved on the device with an
+  idempotency key, and a banner shows the queue. Orders are sent in order when the connection returns. A retry
+  after a lost response never creates a second order.
+- **Meal periods:** **New service…** picks lunch, dinner or late, and a date.
+
+### Install
+
+With Docker (app + Redis, data in a volume):
+
+```bash
+docker compose up -d
+```
+
+Without Docker (installs, builds the UI, seeds and runs the backup drill; `--service` adds a systemd unit):
+
+```bash
+scripts/install.sh
+```
+
+### LLM pilot
+
+In live mode one configured provider reviews the Menu, Procurement and Forecasting proposals. The review has hard
+limits per service:
+- `LLM_MAX_CALLS_PER_SERVICE` calls and `LLM_MAX_COST_PER_SERVICE` dollars
+- `LLM_TIMEOUT_S` per call
+- a circuit breaker after `LLM_BREAKER_FAILURES` failures in a row
+
+When any limit is hit, the proposals go out rule-based and say why ("LLM review skipped: …"). Every call (latency,
+tokens, cost, error) is logged to `llm_calls`, and the LLM panel shows the numbers. Build an eval set from logged
+services (proposals a manager approved or rejected) and score a model against the rule-based baseline before widening
+the pilot:
+
+```bash
+uv run python -m restaurant_ops.live.llm_eval build
+```
+
+```bash
+uv run python -m restaurant_ops.live.llm_eval run --judge live --limit 50
+```
 
 ### Restarts
 
@@ -289,7 +408,13 @@ report is a printable page (`/api/report.html`, Print → Save as PDF) and a CSV
 - Approval timeouts count service minutes (20 by default), so a paused clock freezes them.
 - Price suggestions assume an elasticity: the synthetic history never varies prices, so it can't be estimated. With
   real POS history that includes price changes, this is where an estimate would plug in.
-- Payments and delivery are simulated: no card processor, maps or driver app integration.
+- Simulated guests pay through the simulated processor. Stripe is wired up but only tested against a mocked HTTP
+  transport here. Delivery has no maps or driver app integration.
+- Setup changes apply from the next service, not mid-service.
+- The Docker image and `docker-compose.yml` were not built in this repo's CI environment (no Docker daemon). The
+  install script and the app run under the same commands as the documented local setup.
+- Tests share the real master database (`data/restaurant.db`) for read-mostly checks, so its audit log collects test
+  rows. Tests that edit setup use a private copy.
 - If Redis fails mid-service, the bus falls back to the in-process queue. Events published to Redis but not yet read
   at that moment are not re-dispatched, though they remain in the SQLite event log.
 - One service runs at a time per backend process. Each service gets its own DB copy under `data/live/`.

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import math
+from pathlib import Path
 import re
 from typing import TYPE_CHECKING, Callable
 
@@ -172,7 +173,17 @@ class ToolBox:
             "remaining_forecast": lambda: s.forecast.dish_remaining(s.clock.t / 60),
         }
 
+    def bind(self) -> None:
+        """Point the shared tool registry at this service's database and date. The registry is process-global, so with
+        several services in one process (tests, a resumed service next to a new one) each call re-binds it."""
+        svc = self.svc
+        if R._DB_PATH != Path(svc.db_path):
+            R.set_db_path(svc.db_path)
+        if R.get_sim_date() != svc.date.isoformat():
+            R.set_sim_date(svc.date)
+
     def call(self, trace: list | None, name: str, **kw):
+        self.bind()
         res = self.fns[name](**kw)
         if trace is not None:
             trace.append({"tool": name, "args": compact(kw, 200), "result": compact(res)})

@@ -1,0 +1,35 @@
+# docker compose up -d   ->  http://localhost:8000  (first admin password: docker compose exec app cat data/FIRST_RUN_ADMIN.txt,
+# or set ADMIN_USERNAME / ADMIN_PASSWORD in .env). Backups: docker compose exec app python -m restaurant_ops.live.ops backup
+services:
+  app:
+    build: .
+    image: restaurant-ops:latest
+    restart: unless-stopped
+    ports:
+      - "${LIVE_PORT:-8000}:8000"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      EVENT_BUS: auto
+      COOKIE_SECURE: "${COOKIE_SECURE:-false}"
+    volumes:
+      - ro-data:/app/data
+    depends_on:
+      redis:
+        condition: service_healthy
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - ro-redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+volumes:
+  ro-data:
+  ro-redis:

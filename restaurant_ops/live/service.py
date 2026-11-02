@@ -11,16 +11,18 @@ from __future__ import annotations
 
 import logging
 import math
+from contextlib import contextmanager
 import time
 import uuid
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Callable
 
 from restaurant_ops.agents import decision_log as DL
 from restaurant_ops.agents import llm
+from restaurant_ops import admin as ADMIN
 from restaurant_ops.agents import supervisor as SUP
 from restaurant_ops.config import settings, sim_start_from_db
 from restaurant_ops.core import menu_engineering as ME
@@ -41,7 +43,7 @@ from restaurant_ops.live.bus import make_bus
 from restaurant_ops.live.clock import ServiceClock
 from restaurant_ops.live.coordinator import Coordinator
 from restaurant_ops.live.crm import CRM
-from restaurant_ops.live.floor import LAYOUT_FIXTURES, Floor, Party
+from restaurant_ops.live.floor import LAYOUT_FIXTURES, PLAN_H, PLAN_W, Floor, Party
 from restaurant_ops.live.guests import GuestSim
 from restaurant_ops.live.host import HostError, HostStand
 from restaurant_ops.live.intraday import IntradayForecast
@@ -50,6 +52,10 @@ from restaurant_ops.live.menu_live import LiveMenu
 from restaurant_ops.live.metrics import Metrics
 from restaurant_ops.live.online import NOTIFY_SLIP_MIN, PICKUP_AFTER_MIN, OnlineBook, OnlineOrder, order_total
 from restaurant_ops.live.payments import Dispatcher, PaymentError, Payments
+from restaurant_ops.live.llm_guard import LLMGuard
+from restaurant_ops.live.outputs import KitchenPrinter
+from restaurant_ops.live.po_channel import send_po as po_send
+from restaurant_ops.live.processor import make_processor
 from restaurant_ops.live.safety import FoodSafety, record_donation, waste_analytics
 from restaurant_ops.live.stock import LiveStock
 from restaurant_ops.live.tools import ToolBox
@@ -61,13 +67,21 @@ LAST_SEATING_BEFORE_END_MIN = 60
 LAST_ONLINE_BEFORE_END_MIN = 30
 CAPACITY_30 = 20.0
 LATE_TICKET_MIN = 25.0
+CHECK_IN_MIN = (2.0, 5.0)  # minutes a party spends at the host stand before being walked to a table
+EARLY_HOLD_MAX_MIN = 15.0  # a reservation that turns up early waits in the lobby until ~2 min before its booked time
+INCOMPLETE_SHARE = 0.3     # walk-in groups of 3+ that wait for the rest of their party before being seated
+INCOMPLETE_MIN = (3.0, 10.0)
 BAR_SHARE = 0.35
 FEED_SKIP = {E.CLOCK_TICK, E.KITCHEN_LOAD, E.INVENTORY_SNAPSHOT, E.KPI_UPDATED, E.TABLE_UPDATED, E.QUOTE_UPDATED,
              E.MENU_UPDATED, E.ONLINE_ORDER, E.ITEM_FIRED, E.ITEM_DONE, E.ORDER_SUBMITTED, E.SERVICE_STARTED,
              E.FORECAST_UPDATED, E.HOST_UPDATED, E.CHECK_UPDATED, E.PREP_UPDATED, E.SAFETY_UPDATED}
-DISH_VIEW = {d.id: {"dish_id": d.id, "name": d.name, "category": d.category, "price": d.price, "station": d.station,
-                    "cook_min": cook_minutes(d.id), "quick": is_quick(d.id), "allergens": cat.dish_allergens(d.id)}
-             for d in cat.DISHES}
+def _dish_view() -> dict:
+    return {d.id: {"dish_id": d.id, "name": d.name, "category": d.category, "price": d.price, "station": d.station,
+                   "cook_min": cook_minutes(d.id), "quick": is_quick(d.id), "allergens": cat.dish_allergens(d.id)}
+            for d in cat.DISHES}
+
+
+DISH_VIEW = _dish_view()
 
 Policy = Callable[[dict], "tuple | None"]
 
@@ -76,36 +90,80 @@ class ServiceError(RuntimeError):
     pass
 
 
+def apply_config(conn) -> dict:
+    """Load the admin configuration of `conn` into the runtime catalog (dishes, ingredients, suppliers, stations) and
+    the forecaster's dish list. Called when a service starts."""
+    from restaurant_ops.core import forecasting
+
+    out = cat.reload_from_db(conn)
+    forecasting.refresh_catalog()
+    global DISH_VIEW
+    DISH_VIEW.clear()
+    DISH_VIEW.update(_dish_view())
+    return out
+
+
 class Service:
     def __init__(self, seed: int | None = None, speed: int = 60, bus_kind: str | None = None, source_db: str | Path | None = None,
-                 service_id: str | None = None, auto_policy: Policy | None = None, period: str | None = None):
+                 service_id: str | None = None, auto_policy: Policy | None = None, period: str | None = None,
+                 service_date: "date | str | None" = None):
         src = Path(source_db or settings.DB_PATH)
         if not src.exists():
             raise ServiceError(f"{src} does not exist: seed it first (python -m restaurant_ops.data.seed)")
         self.seed = settings.SEED if seed is None else int(seed)
-        self.date = sim_start_from_db(src) or settings.SIM_START
+        self.master_path = src
+        with self.master() as m:   # the master DB holds gift cards, users, audit, day close: make sure its tables exist
+            ADMIN.seed_defaults(m)
+        first_day = sim_start_from_db(src) or settings.SIM_START
+        self.date = date.fromisoformat(str(service_date)) if service_date else first_day
+        if self.date < first_day:
+            raise ServiceError(f"service date {self.date} is inside the history (first live day {first_day})")
         self.period = period or settings.LIVE_PERIOD
-        self.service_id = service_id or f"svc-{self.date:%Y%m%d}-{datetime.now():%H%M%S}-{uuid.uuid4().hex[:4]}"
+        if self.period not in ("lunch", "dinner", "late"):
+            raise ServiceError("meal period must be lunch, dinner or late")
+        self.service_id = service_id or f"svc-{self.date:%Y%m%d}-{self.period[0]}{datetime.now():%H%M%S}-{uuid.uuid4().hex[:4]}"
         settings.LIVE_DIR.mkdir(parents=True, exist_ok=True)
         self.db_path = settings.LIVE_DIR / f"{self.service_id}.db"
         copy_db(src, self.db_path)
         self.conn = get_conn(self.db_path)
         self.conn.execute("PRAGMA synchronous = NORMAL")
         init_db(self.conn)
+        ADMIN.seed_defaults(self.conn)
+        hours = ADMIN.hours_for(self.conn, self.date, self.period)
+        if hours and hours[2]:
+            raise ServiceError(f"the restaurant is closed for {self.period} on {self.date:%A}s (opening hours)")
         R.set_db_path(self.db_path)
         R.set_sim_date(self.date)
-        self.clock = ServiceClock(self.date, self.period, speed)
+        self.clock = ServiceClock(self.date, self.period, speed, hours=hours[:2] if hours else None)
         self.conn.execute("INSERT INTO service_runs (service_id, service_date, meal_period, seed, started_ts, bus, llm_mode) "
                           "VALUES (?,?,?,?,?,?,?)", (self.service_id, self.date.isoformat(), self.period, self.seed,
                                                      E.wall_now(), "pending", "mock" if llm.is_mock() else llm.describe()))
         self.conn.commit()
-        # world
+        self._build_world()
+        self._init_runtime(bus_kind, auto_policy)
+        self.conn.execute("UPDATE service_runs SET bus=? WHERE service_id=?", (self.bus.kind, self.service_id))
+        regulars = self.crm.seed_regulars(self.seed)
+        for b in self.guests.bookings:  # tonight's book goes to the host stand
+            rid = self.guests.choice(regulars) if regulars and self.guests.aux_chance(0.3) else None
+            g = self.crm.get(rid) if rid else None
+            self.host.create(g["name"] if g else f"Booking {len(self.host.bookings) + 1}", b["size"], t=b["booked_t"],
+                             guest_id=rid, source="sim", arrive_t=None if b["no_show"] else b["t"], allow_overbook=True,
+                             publish=False)
+        self.conn.commit()
+
+    def _build_world(self) -> None:
+        """The restaurant as configured in the admin tables (copied from the master DB when this service started)."""
+        apply_config(self.conn)
+        self.profile = ADMIN.get_profile(self.conn)
+        self.zones = ADMIN.zones_dict(self.conn) or dict(settings.DELIVERY_ZONES)
+        self.tax_rules = [r for r in ADMIN.list_taxes(self.conn) if r["active"]]
+        self.tax_category = {r[0]: r[1] for r in self.conn.execute("SELECT id, tax_category FROM dishes")}
         staff = prep_core.station_staff(self.conn, self.date.isoformat(), self.period)
         self.kitchen = Kitchen(staff, self.seed)
         self.stock = LiveStock(self.conn, self.date)
         self.forecast = IntradayForecast(self.date, self.period)
         self.menu = LiveMenu(self.date)
-        self.floor = Floor()
+        self.floor = Floor(ADMIN.list_tables(self.conn))
         self.online = OnlineBook()
         self.metrics = Metrics()
         res = [dict(r) for r in self.conn.execute("SELECT party_size, kind FROM reservations WHERE date=? AND meal_period=? "
@@ -113,9 +171,8 @@ class Service:
         self.guests = GuestSim(self.seed, self.forecast, res, self.forecast.curve)
         self.host = HostStand(self)
         self.payments = Payments(self)
-        self.dispatcher = Dispatcher(settings.DELIVERY_DRIVERS)
+        self.dispatcher = Dispatcher(settings.DELIVERY_DRIVERS, self.zones)
         self.safety = FoodSafety(self)
-        # bookkeeping
         self.committed: dict[str, int] = {}
         self.item_skip: dict[str, list] = {}
         self.item_meta: dict[str, dict] = {}
@@ -132,16 +189,7 @@ class Service:
         self._last_quote_view: dict[str, tuple] = {}
         self.schedule: list[tuple[float, str]] = []  # (t_min, scenario) for headless runs
         self.sim_since_snapshot = 0.0
-        self._init_runtime(bus_kind, auto_policy)
-        self.conn.execute("UPDATE service_runs SET bus=? WHERE service_id=?", (self.bus.kind, self.service_id))
-        regulars = self.crm.seed_regulars(self.seed)
-        for b in self.guests.bookings:  # tonight's book goes to the host stand
-            rid = self.guests.choice(regulars) if regulars and self.guests.aux_chance(0.3) else None
-            g = self.crm.get(rid) if rid else None
-            self.host.create(g["name"] if g else f"Booking {len(self.host.bookings) + 1}", b["size"], t=b["booked_t"],
-                             guest_id=rid, source="sim", arrive_t=None if b["no_show"] else b["t"], allow_overbook=True,
-                             publish=False)
-        self.conn.commit()
+        self.recovered = None
 
     def _init_runtime(self, bus_kind: str | None, auto_policy: Policy | None) -> None:
         """Everything that is rebuilt (not restored) on resume: bus, tools, CRM, coordinator, agents, subscriptions."""
@@ -149,7 +197,12 @@ class Service:
         self.bus = make_bus(self.service_id, self.conn, clock=lambda: self.clock.iso(), kind=bus_kind)
         self.auto_policy = auto_policy
         self.tools = ToolBox(self)
-        self.crm = CRM(self.conn)
+        self.crm = CRM(self.conn, self.profile.get("loyalty"))
+        self.processor = make_processor()
+        self.printer = KitchenPrinter(self)
+        if not hasattr(self, "llm_guard"):
+            self.llm_guard = LLMGuard(self)
+        self.llm_guard.svc = self
         for obj in (self.host, self.payments, self.safety):
             obj.svc = self
         self.stock.conn = self.conn
@@ -196,6 +249,93 @@ class Service:
         svc.bus.publish(E.AGENT_LOG, {"agent": "service", "message": f"service resumed at {svc.clock.hhmm()} with "
                                       f"{len(svc.coordinator.pending())} approval(s) still pending"})
         svc.bus.publish(E.SERVICE_STARTED, {"service": svc.info(), "snapshot": svc.snapshot(), "resumed": True})
+        svc.flush()
+        return svc
+
+    @contextmanager
+    def master(self):
+        """A short-lived connection to the master database (state that outlives a service: gift cards, users, day close)."""
+        c = get_conn(self.master_path)
+        try:
+            init_db(c)
+            yield c
+            c.commit()
+        finally:
+            c.close()
+
+    @classmethod
+    def recover_from_log(cls, service_id: str, auto_policy: Policy | None = None, bus_kind: str | None = None) -> "Service":
+        """Last-resort restore when no snapshot is readable: continue the service on its database (stock, menu state,
+        bookings, payments already recorded) and rebuild the decisions from the event log, so pending approvals still
+        resume from their LangGraph checkpoints. Guests on the floor, kitchen queues and online orders in progress
+        cannot be rebuilt from the log and are reported as lost."""
+        import json as _json
+
+        db_path = settings.LIVE_DIR / f"{service_id}.db"
+        if not db_path.exists():
+            raise ServiceError(f"no database for {service_id}")
+        svc = cls.__new__(cls)
+        svc.service_id, svc.db_path = service_id, db_path
+        svc.conn = get_conn(db_path)
+        svc.conn.execute("PRAGMA synchronous = NORMAL")
+        init_db(svc.conn)
+        run = svc.conn.execute("SELECT * FROM service_runs WHERE service_id=?", (service_id,)).fetchone()
+        if run is None:
+            raise ServiceError(f"{service_id}: no service_runs row")
+        svc.seed, svc.date, svc.period = int(run["seed"]), date.fromisoformat(run["service_date"]), run["meal_period"]
+        svc.master_path = settings.DB_PATH
+        R.set_db_path(db_path)
+        R.set_sim_date(svc.date)
+        hours = ADMIN.hours_for(svc.conn, svc.date, svc.period)
+        svc.clock = ServiceClock(svc.date, svc.period, 10, hours=hours[:2] if hours else None)
+        svc._build_world()
+        last = svc.conn.execute("SELECT seq, sim_ts FROM event_log WHERE service_id=? ORDER BY seq DESC LIMIT 1", (service_id,)).fetchone()
+        if last and last["sim_ts"]:
+            svc.clock.now = datetime.fromisoformat(last["sim_ts"])
+        svc._init_runtime(bus_kind, auto_policy)
+        svc.bus.seq = int(last["seq"]) if last else 0
+        for dish, status, note in svc.conn.execute("SELECT dish_id, status, note FROM menu_state WHERE date=?", (svc.date.isoformat(),)):
+            if status == "86":
+                svc.menu.eighty_sixed[dish] = note or "86"
+            elif status == "special":
+                svc.menu.specials[dish] = {"portions": 0, "note": note or "special"}
+        views: dict[int, dict] = {}
+        kpi = None
+        for t, payload in svc.conn.execute("SELECT type, payload FROM event_log WHERE service_id=? AND type IN "
+                                           "('decision.proposed','decision.resolved','kpi.updated') ORDER BY seq", (service_id,)):
+            p = _json.loads(payload)
+            if t == E.KPI_UPDATED:
+                kpi = p
+            else:
+                views[int(p["id"])] = {**views.get(int(p["id"]), {}), **p}
+        for did, v in views.items():
+            v.setdefault("context", {})
+            if v["status"] == "auto":
+                v["status"] = "executed"
+            svc.coordinator.decisions[did] = v
+            if v["status"] == "pending":
+                svc.coordinator.open_by_key[v["key"]] = did
+        if kpi:
+            for k in ("covers", "covers_arrived", "orders", "online_orders", "revenue", "food_cost", "waste_value", "eighty_six"):
+                attr = {"covers": "covers_seated"}.get(k, k)
+                if kpi.get(k) is not None and hasattr(svc.metrics, attr):
+                    setattr(svc.metrics, attr, kpi[k])
+        for b in svc.conn.execute("SELECT * FROM bookings WHERE service_id=?", (service_id,)):
+            from restaurant_ops.live.host import Booking
+
+            svc.host.bookings[b["booking_id"]] = Booking(b["booking_id"], b["name"], int(b["party_size"]), svc.host.t_of(b["time"]),
+                                                        status=b["status"], phone=b["phone"] or "", guest_id=b["guest_id"],
+                                                        notes=b["notes"] or "", source=b["source"] or "phone")
+        svc.host._n = len(svc.host.bookings)
+        svc.prep.attach()
+        svc.status = "running"
+        svc.recovered = {"from": "event log", "at": svc.clock.hhmm(),
+                         "lost": "guests on the floor, kitchen queues and online orders in progress",
+                         "kept": f"stock, menu state, {len(svc.host.bookings)} bookings, {len(views)} decisions "
+                                 f"({len(svc.coordinator.pending())} pending), KPIs"}
+        svc.bus.publish(E.AGENT_LOG, {"agent": "service", "message": f"recovered from the event log at {svc.clock.hhmm()}: kept "
+                                      f"{svc.recovered['kept']}; lost {svc.recovered['lost']}"})
+        svc.bus.publish(E.SERVICE_STARTED, {"service": svc.info(), "snapshot": svc.snapshot(), "resumed": True, "recovered": True})
         svc.flush()
         return svc
 
@@ -337,7 +477,7 @@ class Service:
             fut = entry["future"]
             if fut.done() or now > entry["deadline"]:
                 self.pending_llm.remove(entry)
-                entry["agent"].finish_review(entry["proposals"], fut if fut.done() else None)
+                entry["agent"].finish_review(entry["proposals"], fut if fut.done() else None, entry.get("t0"))
 
     # ================================================================== floor
     def _arrive(self, size: int, kind: str, t: float, preorder: bool = False, guest_id: int | None = None,
@@ -349,16 +489,36 @@ class Service:
         self.metrics.parties += 1
         self.metrics.covers_arrived += p.size
         seats = self.floor.find_seating(p.size, prefer_bar=kind == "walk_in" and p.size <= 2 and self.guests.chance(BAR_SHARE))
+        if seats and not preorder and kind in ("walk_in", "reservation"):
+            # guests check in with the host first (name, coats, the right table) and wait in the lobby meanwhile
+            hold = self.guests.uniform(CHECK_IN_MIN[0], CHECK_IN_MIN[1])
+            p.wait_reason = "checking in"
+            b = self.host.bookings.get(booking_id) if booking_id else None
+            if b is not None and (b.time_t - self.clock.t) / 60 - 2 > hold:
+                hold = min(EARLY_HOLD_MAX_MIN, (b.time_t - self.clock.t) / 60 - 2)
+                p.wait_reason = f"early for {self.host.hhmm(b.time_t)}"
+            elif kind == "walk_in" and p.size >= 3 and self.guests.uniform(0, 1) < INCOMPLETE_SHARE:
+                hold += self.guests.uniform(INCOMPLETE_MIN[0], INCOMPLETE_MIN[1])
+                p.wait_reason = "waiting for the rest of the party"
+            p.greet_until = self.clock.t + hold * 60
+            p.patience_until = None
+            p.prefer_tables = seats
+            self.floor.waitlist.append(p.id)
+            self.host.on_waitlisted(p)
+            seats = None
+            checking_in = True
+        else:
+            checking_in = False
         if seats:
             self._seat(p, seats, self.clock.t)
-        else:
+        elif not checking_in:
             if preorder or kind == "reservation" or patience is None:
                 p.patience_until = None  # booked guests and named waitlist entries wait for their table
             else:
                 p.patience_until = self.clock.t + self.guests.minutes("patience") * 60
             self.floor.waitlist.append(p.id)
             self.host.on_waitlisted(p)
-        self.bus.publish(E.PARTY_ARRIVED, {"party_id": p.id, "size": p.size, "kind": kind, "seated": bool(seats),
+        self.bus.publish(E.PARTY_ARRIVED, {"party_id": p.id, "size": p.size, "kind": kind, "seated": bool(seats), "checking_in": checking_in,
                                            "table_ids": p.table_ids, "waitlist": len(self.floor.waitlist),
                                            "guest_id": guest_id, "booking_id": booking_id}, source="floor")
         if not seats:
@@ -395,7 +555,10 @@ class Service:
                 self.bus.publish(E.PARTY_LEFT, {"party_id": pid, "size": p.size, "reason": "gave up waiting"}, source="floor")
                 self.host.publish()
                 continue
-            seats = self.floor.find_seating(p.size)
+            if p.greet_until is not None and t < p.greet_until:
+                continue  # still checking in at the host stand
+            pref = getattr(p, "prefer_tables", None)
+            seats = pref if pref and all(self.floor.free(x) for x in pref) else self.floor.find_seating(p.size)
             if seats:
                 self._seat(p, seats, t)
                 self.host.publish()
@@ -605,7 +768,7 @@ class Service:
         if cart:
             self._n_cust += 1
             delivery = self.guests.aux_chance(settings.DELIVERY_SHARE)
-            zone = self.guests.choice(sorted(settings.DELIVERY_ZONES)) if delivery else None
+            zone = self.guests.choice(sorted(self.zones)) if delivery and self.zones else None
             self.submit_order("online", cart, customer=f"Guest {self._n_cust}", source="sim",
                               fulfilment="delivery" if delivery else "pickup", zone=zone)
 
@@ -624,10 +787,10 @@ class Service:
                 continue  # hidden online at once
             rows.append(v)
         return {"mode": self.online.mode, "reason": self.online.mode_reason, "dishes": rows,
-                "zones": settings.DELIVERY_ZONES, "tax_rate": settings.TAX_RATE}
+                "zones": self.zones, "taxes": [{k: r[k] for k in ("name", "rate", "applies_to", "channel")} for r in self.tax_rules]}
 
     def _delivery_extra(self, zone: str, ready_t: float) -> float:
-        z = Dispatcher.zone(zone)
+        z = self.dispatcher.zone(zone)
         return self.dispatcher.driver_wait_min(ready_t) + z["drive_min"]
 
     def quote_preview(self, dish_ids: list[str], fulfilment: str = "pickup", zone: str | None = None) -> dict:
@@ -635,9 +798,9 @@ class Service:
         q = self.kitchen.quote(dish_ids, self.clock.t, PACK_BUFFER_MIN)
         extra = 0.0
         if fulfilment == "delivery":
-            extra = self._delivery_extra(zone or "A", self.clock.t + q["p50_min"] * 60)
+            extra = self._delivery_extra(zone or next(iter(self.zones)), self.clock.t + q["p50_min"] * 60)
         p50, p90 = q["p50_min"] + extra, q["p90_min"] + extra * 1.15
-        fee = Dispatcher.zone(zone or "A")["fee"] if fulfilment == "delivery" else 0.0
+        fee = self.dispatcher.zone(zone or next(iter(self.zones)))["fee"] if fulfilment == "delivery" else 0.0
         return {**q, "p50_min": round(p50, 1), "p90_min": round(p90, 1), "kitchen_p50_min": q["p50_min"], "delivery_min": round(extra, 1),
                 "range_hhmm": [self.clock.hhmm(self.clock.t + p50 * 60), self.clock.hhmm(self.clock.t + p90 * 60)],
                 "busyness": load["busyness"], "explanation": self.order.explain(load), "mode": self.online.mode,
@@ -653,8 +816,12 @@ class Service:
         if fulfilment == "delivery":
             if not zone:
                 raise ServiceError("delivery needs a zone")
+            mino = self.zones.get(zone, {}).get("min_order", 0) or 0
+            sub = sum(cat.DISHES_BY_ID[i["dish_id"]].price for i in items if i["dish_id"] in cat.DISHES_BY_ID)
+            if sub < mino:
+                raise ServiceError(f"zone {zone} needs a minimum order of ${mino:.2f}")
             try:
-                Dispatcher.zone(zone)
+                self.dispatcher.zone(zone)
             except PaymentError as e:
                 raise ServiceError(str(e)) from e
         bad = [i["dish_id"] for i in items if i["dish_id"] not in allowed]
@@ -683,7 +850,7 @@ class Service:
         fulfil = o.get("fulfilment") or "pickup"
         zone = o.get("zone")
         extra = self._delivery_extra(zone, t + est["p50_min"] * 60) if fulfil == "delivery" else 0.0
-        fee = Dispatcher.zone(zone)["fee"] if fulfil == "delivery" else 0.0
+        fee = self.dispatcher.zone(zone)["fee"] if fulfil == "delivery" else 0.0
         p50, p90 = t + (est["p50_min"] + extra) * 60, t + (est["p90_min"] + extra * 1.15) * 60
         dishes = [i.dish_id for i in items]
         oo = OnlineOrder(o["order_id"], self._customer_of(o), [i.item_id for i in items], dishes,
@@ -824,6 +991,10 @@ class Service:
         self.flush()
         p = d["payload"]
         res = R.send_po(supplier_id=p["supplier_id"], delivery_date=p["delivery_date"], lines=p["lines"], decision_id=d["id"])
+        try:  # PDF + e-mail to the supplier (or the outbox); a mail problem never undoes the PO
+            res["outbox"] = po_send(self.conn, res["po_id"], self.profile)["status"]
+        except Exception as e:  # noqa: BLE001
+            res["outbox"] = f"failed: {type(e).__name__}"
         self.bus.publish(E.PO_SENT, {**res, "title": d["title"]}, source="procurement")
         return res
 
@@ -1015,7 +1186,9 @@ class Service:
                 "end": self.clock.end.isoformat(timespec="minutes"), "seed": self.seed, "bus": self.bus.kind,
                 "llm_mode": "mock" if llm.is_mock() else llm.describe(), "status": self.status,
                 "approval_timeout_min": settings.APPROVAL_TIMEOUT_SIM_MIN, "po_threshold": settings.LIVE_PO_APPROVAL_THRESHOLD,
-                "auth_enabled": settings.AUTH_ENABLED,
+                "auth_enabled": settings.AUTH_ENABLED, "recovered": getattr(self, "recovered", None),
+                "restaurant": (getattr(self, "profile", None) or {}).get("name", "Bistro 80"),
+                "processor": getattr(getattr(self, "processor", None), "name", "simulated"),
                 "reservations": len(self.guests.bookings), "booked_covers": self.guests.booked_covers}
 
     def clock_view(self) -> dict:
@@ -1035,7 +1208,7 @@ class Service:
     def snapshot(self) -> dict:
         t = self.clock.t
         return {"service": self.info(), "clock": self.clock_view(),
-                "layout": {"width": 1000, "height": 640, "fixtures": LAYOUT_FIXTURES},
+                "layout": {"width": PLAN_W, "height": PLAN_H, "fixtures": LAYOUT_FIXTURES},
                 "tables": {tid: self.floor.table_view(tid, t) for tid in self.floor.tables},
                 "kitchen": self.kitchen_load(), "inventory": self.inventory_view(), "forecast": self.forecast.snapshot(),
                 "menu": self.menu.snapshot(),
@@ -1047,7 +1220,7 @@ class Service:
                 "checks": {c.check_id: self.payments.view(c) for c in self.payments.checks.values()
                            if c.status == "open" or (self.clock.t - (c.closed_t or 0)) < 30 * 60},
                 "prep": self.prep.view(), "safety": self.safety.view(), "drivers": self.dispatcher.view(self.clock.t),
-                "zones": settings.DELIVERY_ZONES,
+                "zones": self.zones,
                 "scenarios": [{"name": k, "label": v[1]} for k, v in SC.SCENARIOS.items()]}
 
     def _publish_state(self) -> None:

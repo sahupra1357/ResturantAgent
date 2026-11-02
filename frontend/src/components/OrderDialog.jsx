@@ -38,10 +38,15 @@ export default function OrderDialog({ state, table, onClose }) {
     try {
       let guest_id = null
       if (phone.trim()) {
-        const found = (await api.guests(phone.trim())).find((g) => g.phone === phone.trim())
-        guest_id = found ? found.guest_id : (await api.createGuest({ name: `Guest ${phone.trim()}`, phone: phone.trim() })).guest_id
+        try {
+          const found = (await api.guests(phone.trim())).find((g) => g.phone === phone.trim())
+          guest_id = found ? found.guest_id : (await api.createGuest({ name: `Guest ${phone.trim()}`, phone: phone.trim() })).guest_id
+        } catch (e) {
+          if (!e.network) throw e // offline: send the order without the guest profile
+        }
       }
-      const r = await api.tableOrder({ table_id: table.id, items: cart, notes, party_size: free ? Number(size) : null, guest_id })
+      const r = await api.tableOrder({ table_id: table.id, items: cart, notes, party_size: free ? Number(size) : null, guest_id },
+        `${table.id}: ${cart.length} item(s)`)
       setResult(r); setCart([])
     } catch (e) { setError(e.message) } finally { setBusy(false) }
   }
@@ -87,7 +92,8 @@ export default function OrderDialog({ state, table, onClose }) {
           </div>
         )}
         {error && <p className="err">{error}</p>}
-        {result && (
+        {result?.queued && <p className="warn-box" role="status">{result.message}</p>}
+        {result && !result.queued && (
           <div className="result">
             <b>{result.order_id}</b> routed in {result.latency_ms} ms
             <ul>

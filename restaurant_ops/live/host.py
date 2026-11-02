@@ -200,6 +200,9 @@ class HostStand:
         return {"party_id": p.id, "seated": p.state != "waiting", "table_ids": p.table_ids, "quoted_min": quote if p.state == "waiting" else 0}
 
     def on_waitlisted(self, party) -> None:
+        if party.greet_until is not None:
+            self.quotes[party.id] = {"quoted_min": round((party.greet_until - self.svc.clock.t) / 60, 0), "at": self.svc.clock.t}
+            return
         if party.id not in self.quotes:
             ahead = [self.svc.floor.parties[pid] for pid in self.svc.floor.waitlist
                      if pid != party.id and self.svc.floor.parties[pid].size <= party.size + 2]
@@ -212,7 +215,9 @@ class HostStand:
             p = fl.parties[pid]
             q = self.quotes.get(pid, {})
             waited = (now - p.arrive_at) / 60
+            checking_in = p.greet_until is not None and now < p.greet_until
             out.append({"party_id": pid, "size": p.size, "name": p.name or f"Party {pid}", "kind": p.kind, "position": i + 1,
+                        "checking_in": checking_in, "reason": (getattr(p, "wait_reason", "") or "checking in") if checking_in else "no table yet",
                         "waited_min": round(waited, 0), "quoted_min": q.get("quoted_min"),
                         "remaining_min": max(0.0, round((q.get("quoted_min") or 0) - waited, 0)),
                         "guest_id": p.guest_id, "preorder": p.preorder})

@@ -273,8 +273,10 @@ def test_server_api_and_websocket():
 
     from restaurant_ops.config import settings
 
-    mgr = {"Authorization": f"Bearer {settings.MANAGER_TOKEN}"}
-    with TestClient(server.app) as c:
+    from tests.conftest import bearer
+
+    mgr = bearer("manager")
+    with TestClient(server.app, headers=mgr) as c:
         st = c.get("/api/state").json()
         assert len(st["tables"]) == 28 and st["service"]["status"] == "running"
         assert c.post("/api/clock", json={"speed": 0}, headers=mgr).json()["speed"] == 0

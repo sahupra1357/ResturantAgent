@@ -845,7 +845,12 @@ module and is covered by `tests/test_live_round2.py` (31 tests) and the frontend
 | --- | --- | --- |
 | Prep & staffing agent (6th) | `live/agents/prep.py`, `live/kitchen.py` | Mise en place from the forecast prep list, burned down as items fire (none left = cooked from scratch, 30% slower, and quotes know it); prep batches; call a cook in when a station stays behind (labour budget enforced by the constraint checker), release when calm |
 | Negotiation + supplier learning | `live/agents/procurement.py`, `core/suppliers.py` | Emergency PO lines are negotiated with the vendor agent; fill rates blend priors with PO history and drop on every shortfall, so quotes price the risk |
-| Auth & roles | `live/server.py` | Manager / server / kitchen bearer tokens on every mutating endpoint; reads, the public online page and the WebSocket stay open |
+| Auth & roles | `live/auth.py`, `live/server.py` | Named users (admin / manager / server / kitchen), cookie or Bearer sessions, CSRF header for cookie writes, audit log of every write; only the online-order endpoints and `/ws/public` are open |
+| Setup | `admin.py`, `db/migrations.py` | Profile, taxes, hours, tables, stations, zones, ingredients, dishes + recipes, suppliers, staff + roster in the master DB; applied when a service starts |
+| Money edges | `live/processor.py`, `live/giftcards.py`, `live/payments.py` | Simulated or Stripe card processor, gift cards with a ledger, loyalty points, multi-jurisdiction tax lines |
+| Outputs | `live/po_channel.py`, `live/outputs.py` | PO PDF + e-mail / outbox; kitchen chits (file or ESC/POS) and the KDS |
+| Operations | `live/dayclose.py`, `live/ops.py`, `live/persistence.py` | Day close + journal export, backups / restore / drill, rotated checksummed snapshots with event-log recovery |
+| LLM pilot | `live/llm_guard.py`, `live/llm_eval.py` | Call / cost / timeout caps, circuit breaker, call log; eval set from logged decisions |
 | Persistence | `live/persistence.py`, `live/coordinator.py` | SQLite checkpoints for approval interrupts + pickled service state; `Service.resume` continues a dinner after a restart with pending approvals intact |
 | Host stand | `live/host.py` | Bookings (create / cancel / no-show / arrive), overbooking control, waitlist with quoted waits, move / combine / split tables |
 | Payments & delivery | `live/payments.py` | Checks, even or by-seat splits, tips, discounts and refunds through the constraint checker; prepaid online orders; delivery zones, fees and driver dispatch |

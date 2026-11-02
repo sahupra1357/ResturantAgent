@@ -1,4 +1,5 @@
-"""Operability: structured (JSON) logging, a Prometheus /metrics exposition, and retention of live service files."""
+"""Operability: structured (JSON) logging, a Prometheus /metrics exposition, retention of live service files, and
+backups with restore and a restore drill (`python -m restaurant_ops.live.ops backup|list|verify|restore|drill`)."""
 from __future__ import annotations
 
 import json
@@ -116,16 +117,156 @@ def cleanup(retention_days: int | None = None, keep_last: int | None = None, kee
     return {"removed": removed, "kept_services": kept, "retention_days": days, "keep_last": last, "dry_run": dry_run}
 
 
+# =========================================================================== backups, restore, drill
+
+
+def _sha(path) -> str:
+    import hashlib
+
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def backup(label: str = "") -> dict:
+    """Consistent copies (SQLite online backup) of the master DB and every live service DB, plus service snapshots and
+    approval checkpoints, with a SHA-256 manifest. Keeps the newest BACKUP_KEEP backups."""
+    import shutil
+    from datetime import datetime as _dt
+
+    from restaurant_ops.db.connection import copy_db
+
+    bid = _dt.now().strftime("%Y%m%d-%H%M%S") + (f"-{label}" if label else "")
+    root = settings.BACKUP_DIR / bid
+    (root / "live").mkdir(parents=True, exist_ok=True)
+    files = {}
+    if settings.DB_PATH.exists():
+        copy_db(settings.DB_PATH, root / "restaurant.db")
+        files["restaurant.db"] = _sha(root / "restaurant.db")
+    if settings.LIVE_DIR.exists():
+        for f in sorted(settings.LIVE_DIR.glob("svc-*")):
+            if f.name.endswith((".db-wal", ".db-shm", ".tmp")):
+                continue
+            dst = root / "live" / f.name
+            if f.suffix in (".db", ".sqlite"):
+                copy_db(f, dst)
+            else:
+                shutil.copy2(f, dst)
+            files[f"live/{f.name}"] = _sha(dst)
+    manifest = {"backup_id": bid, "created": time.strftime("%Y-%m-%dT%H:%M:%S"), "files": files}
+    (root / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    olds = sorted([d for d in settings.BACKUP_DIR.iterdir() if d.is_dir()], key=lambda d: d.name)
+    for d in olds[: max(0, len(olds) - settings.BACKUP_KEEP)]:
+        shutil.rmtree(d, ignore_errors=True)
+    return {"backup_id": bid, "path": str(root), "files": len(files)}
+
+
+def list_backups() -> list[dict]:
+    if not settings.BACKUP_DIR.exists():
+        return []
+    out = []
+    for d in sorted(settings.BACKUP_DIR.iterdir(), reverse=True):
+        m = d / "manifest.json"
+        if m.exists():
+            man = json.loads(m.read_text())
+            out.append({"backup_id": man["backup_id"], "created": man["created"], "files": len(man["files"])})
+    return out
+
+
+def verify_backup(backup_id: str) -> dict:
+    root = settings.BACKUP_DIR / backup_id
+    man = json.loads((root / "manifest.json").read_text())
+    bad = [name for name, digest in man["files"].items() if not (root / name).exists() or _sha(root / name) != digest]
+    return {"backup_id": backup_id, "files": len(man["files"]), "corrupt_or_missing": bad, "ok": not bad}
+
+
+def restore(backup_id: str, data_dir=None, live_dir=None) -> dict:
+    """Copy a verified backup into data_dir / live_dir (defaults: the live locations; stop the service first)."""
+    import shutil
+    from pathlib import Path as _P
+
+    v = verify_backup(backup_id)
+    if not v["ok"]:
+        raise RuntimeError(f"backup {backup_id} failed verification: {v['corrupt_or_missing']}")
+    root = settings.BACKUP_DIR / backup_id
+    data_dir = _P(data_dir) if data_dir else settings.DB_PATH.parent
+    live_dir = _P(live_dir) if live_dir else settings.LIVE_DIR
+    data_dir.mkdir(parents=True, exist_ok=True)
+    live_dir.mkdir(parents=True, exist_ok=True)
+    n = 0
+    if (root / "restaurant.db").exists():
+        for suffix in ("-wal", "-shm"):
+            (data_dir / f"restaurant.db{suffix}").unlink(missing_ok=True)
+        shutil.copy2(root / "restaurant.db", data_dir / "restaurant.db")
+        n += 1
+    for f in (root / "live").glob("*"):
+        shutil.copy2(f, live_dir / f.name)
+        n += 1
+    return {"backup_id": backup_id, "restored_files": n, "data_dir": str(data_dir), "live_dir": str(live_dir)}
+
+
+def drill() -> dict:
+    """Restore drill: take a backup, restore it into a scratch directory, and prove it is usable: checksums, SQLite
+    integrity_check on every database, key tables present, and the newest service snapshot loads."""
+    import pickle
+    import sqlite3
+    import tempfile
+    from pathlib import Path as _P
+
+    b = backup("drill")
+    checks = []
+    with tempfile.TemporaryDirectory() as tmp:
+        r = restore(b["backup_id"], _P(tmp) / "data", _P(tmp) / "live")
+        dbs = [_P(tmp) / "data" / "restaurant.db", *sorted((_P(tmp) / "live").glob("svc-*.db"))]
+        for db in dbs:
+            if not db.exists():
+                continue
+            c = sqlite3.connect(db)
+            try:
+                integ = c.execute("PRAGMA integrity_check").fetchone()[0]
+                tables = {t[0] for t in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                need = {"dishes", "ingredients", "lots"} | ({"event_log"} if db.parent.name == "live" else {"users"})
+                checks.append({"db": db.name, "integrity": integ, "missing_tables": sorted(need - tables)})
+            finally:
+                c.close()
+        snaps = sorted((_P(tmp) / "live").glob("svc-*.state.pkl"), key=lambda x: x.stat().st_mtime, reverse=True)
+        snap_ok = None
+        if snaps:
+            try:
+                pickle.loads(snaps[0].read_bytes())
+                snap_ok = snaps[0].name
+            except Exception as e:  # noqa: BLE001
+                snap_ok = f"FAILED: {type(e).__name__}"
+    ok = all(c["integrity"] == "ok" and not c["missing_tables"] for c in checks) and not str(snap_ok).startswith("FAILED")
+    return {"ok": ok, "backup_id": b["backup_id"], "restored_files": r["restored_files"], "databases": checks, "snapshot": snap_ok}
+
+
 def main(argv: list[str] | None = None) -> int:
     import argparse
 
-    ap = argparse.ArgumentParser(description="Delete old live-service and batch-run databases")
+    ap = argparse.ArgumentParser(description="Operations: cleanup (default), backup, verify, restore, drill")
+    ap.add_argument("command", nargs="?", default="cleanup", choices=["cleanup", "backup", "list", "verify", "restore", "drill"])
+    ap.add_argument("backup_id", nargs="?")
     ap.add_argument("--days", type=int, default=None)
     ap.add_argument("--keep-last", type=int, default=None)
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args(argv)
-    print(json.dumps(cleanup(a.days, a.keep_last, dry_run=a.dry_run), indent=2))
-    return 0
+    if a.command == "backup":
+        out = backup()
+    elif a.command == "list":
+        out = list_backups()
+    elif a.command == "verify":
+        out = verify_backup(a.backup_id)
+    elif a.command == "restore":
+        out = restore(a.backup_id)
+    elif a.command == "drill":
+        out = drill()
+    else:
+        out = cleanup(a.days, a.keep_last, dry_run=a.dry_run)
+    print(json.dumps(out, indent=2))
+    return 0 if not isinstance(out, dict) or out.get("ok", True) else 1
 
 
 if __name__ == "__main__":

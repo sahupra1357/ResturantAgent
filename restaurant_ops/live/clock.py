@@ -15,8 +15,13 @@ def period_bounds(service_date: date, period: str) -> tuple[datetime, datetime]:
 
 
 class ServiceClock:
-    def __init__(self, service_date: date, period: str = "dinner", speed: int = 60):
-        self.start, self.end = period_bounds(service_date, period)
+    def __init__(self, service_date: date, period: str = "dinner", speed: int = 60, hours: tuple[str, str] | None = None):
+        """`hours` = (open, close) HH:MM from the admin opening hours; default PERIOD_HOURS."""
+        if hours:
+            self.start = datetime.combine(service_date, datetime.strptime(hours[0], "%H:%M").time())
+            self.end = datetime.combine(service_date, datetime.strptime(hours[1], "%H:%M").time())
+        else:
+            self.start, self.end = period_bounds(service_date, period)
         self.now: datetime = self.start
         self.speed = speed
 

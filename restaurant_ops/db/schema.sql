@@ -363,3 +363,78 @@ CREATE TABLE IF NOT EXISTS supplier_perf (
     id INTEGER PRIMARY KEY AUTOINCREMENT, supplier_id TEXT NOT NULL, ts TEXT NOT NULL, kind TEXT NOT NULL,
     fill REAL, late INTEGER, weight REAL NOT NULL, fill_rate_after REAL, delay_prob_after REAL, note TEXT
 );
+
+-- ---------------------------------------------------------------------------------------------------------
+-- Round 3: admin / onboarding, identity, money, operations. Admin tables live in the master DB and are copied
+-- into each service DB when the service starts (a service runs on the configuration it started with).
+CREATE TABLE IF NOT EXISTS config_kv (key TEXT PRIMARY KEY, value JSON NOT NULL);
+CREATE TABLE IF NOT EXISTS tax_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, jurisdiction TEXT NOT NULL, rate REAL NOT NULL,
+    applies_to TEXT NOT NULL DEFAULT 'all',      -- food | alcohol | delivery_fee | all
+    channel TEXT NOT NULL DEFAULT 'all',         -- all | dine_in | online
+    active INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS opening_hours (
+    weekday INTEGER NOT NULL, meal_period TEXT NOT NULL, open TEXT NOT NULL, close TEXT NOT NULL,
+    closed INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (weekday, meal_period)
+);
+CREATE TABLE IF NOT EXISTS floor_tables (
+    id TEXT PRIMARY KEY, seats INTEGER NOT NULL, x REAL NOT NULL, y REAL NOT NULL, w REAL NOT NULL, h REAL NOT NULL,
+    shape TEXT NOT NULL, section TEXT NOT NULL DEFAULT '', active INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS stations (
+    id TEXT PRIMARY KEY, name TEXT NOT NULL, parallel INTEGER NOT NULL DEFAULT 3, cook_factor REAL NOT NULL DEFAULT 2.4,
+    lunch_cooks INTEGER NOT NULL DEFAULT 1, dinner_cooks INTEGER NOT NULL DEFAULT 2, late_cooks INTEGER NOT NULL DEFAULT 1,
+    active INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS delivery_zones (
+    id TEXT PRIMARY KEY, label TEXT NOT NULL, fee REAL NOT NULL, drive_min REAL NOT NULL, min_order REAL NOT NULL DEFAULT 0,
+    active INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS staff (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, role TEXT NOT NULL, station TEXT,
+    hourly_rate REAL NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS roster (
+    date DATE NOT NULL, meal_period TEXT NOT NULL, staff_id INTEGER NOT NULL, station TEXT,
+    PRIMARY KEY (date, meal_period, staff_id)
+);
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE, display_name TEXT NOT NULL, role TEXT NOT NULL,
+    pw_hash TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, created TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sessions (
+    token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL, created TEXT NOT NULL, expires TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, username TEXT, role TEXT, method TEXT NOT NULL,
+    path TEXT NOT NULL, status INTEGER, detail JSON
+);
+CREATE TABLE IF NOT EXISTS gift_cards (
+    code TEXT PRIMARY KEY, initial REAL NOT NULL, balance REAL NOT NULL, issued TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active', note TEXT
+);
+CREATE TABLE IF NOT EXISTS idempotency (
+    key TEXT PRIMARY KEY, endpoint TEXT NOT NULL, response JSON NOT NULL, created TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS day_close (
+    date DATE NOT NULL, meal_period TEXT NOT NULL, service_id TEXT NOT NULL, closed_ts TEXT NOT NULL, closed_by TEXT,
+    report JSON NOT NULL, PRIMARY KEY (date, meal_period)
+);
+CREATE TABLE IF NOT EXISTS po_outbox (
+    po_id TEXT PRIMARY KEY, supplier_id TEXT NOT NULL, email TEXT, pdf_path TEXT, eml_path TEXT,
+    status TEXT NOT NULL, sent_ts TEXT, error TEXT
+);
+CREATE TABLE IF NOT EXISTS kds_bumps (
+    service_id TEXT NOT NULL, item_id TEXT NOT NULL, bumped_ts TEXT NOT NULL, by_user TEXT,
+    PRIMARY KEY (service_id, item_id)
+);
+CREATE TABLE IF NOT EXISTS llm_calls (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, service_id TEXT, ts TEXT NOT NULL, agent TEXT, provider TEXT, model TEXT,
+    latency_ms REAL, ok INTEGER, tokens_in INTEGER, tokens_out INTEGER, cost REAL, error TEXT
+);
+CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS gift_card_ledger (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT NOT NULL, ts TEXT NOT NULL, kind TEXT NOT NULL,  -- issue | redeem | refund | void
+    amount REAL NOT NULL, ref TEXT, service_id TEXT
+);

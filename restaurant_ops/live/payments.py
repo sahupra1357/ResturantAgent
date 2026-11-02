@@ -21,7 +21,8 @@ from restaurant_ops.live.events import wall_now
 if TYPE_CHECKING:  # pragma: no cover
     from restaurant_ops.live.service import Service
 
-METHODS = ("card", "cash", "wallet", "online")
+METHODS = ("card", "cash", "wallet", "online", "gift_card", "points")
+PROCESSOR_METHODS = ("card", "wallet", "online")
 
 
 class PaymentError(ValueError):
@@ -64,19 +65,43 @@ class Payments:
         return {k: v for k, v in self.__dict__.items() if k != "svc"}
 
     # ------------------------------------------------------------------ totals
-    @staticmethod
-    def totals(c: Check) -> dict:
+    def _category(self, line: dict) -> str:
+        if line.get("is_fee"):
+            return "delivery_fee"
+        return (getattr(self.svc, "tax_category", {}) or {}).get(line.get("dish_id"), "food")
+
+    def tax_lines(self, c: Check, sub: float, disc: float) -> list[dict]:
+        """Tax per rule: each line's share of the bill (after discounts, pro rata) x every active rule that covers its
+        category ('all' covers everything) and channel. Without rules: TAX_RATE on food."""
+        share = (1 - disc / sub) if sub > 0 else 0.0
+        by_cat: dict[str, float] = {}
+        for l in c.lines:
+            by_cat[self._category(l)] = by_cat.get(self._category(l), 0.0) + l["price"] * share
+        rules = getattr(self.svc, "tax_rules", None)
+        if not rules:
+            return [{"name": "Sales tax", "jurisdiction": "", "rate": settings.TAX_RATE,
+                     "amount": _r(by_cat.get("food", 0.0) * settings.TAX_RATE)}]
+        out = []
+        for r in rules:
+            if r["channel"] not in ("all", c.channel):
+                continue
+            base = sum(v for k, v in by_cat.items() if r["applies_to"] in ("all", k))
+            if base > 0:
+                out.append({"name": r["name"], "jurisdiction": r["jurisdiction"], "rate": r["rate"], "amount": _r(base * r["rate"])})
+        return out
+
+    def totals(self, c: Check) -> dict:
         sub = sum(l["price"] for l in c.lines)
-        disc = sum(d["amount"] for d in c.discounts) + sum(x["amount"] for x in c.comps)
+        disc = min(sub, sum(d["amount"] for d in c.discounts) + sum(x["amount"] for x in c.comps))
         taxable = max(0.0, sub - disc)
-        fee = sum(l.get("fee", 0.0) for l in c.lines if l.get("is_fee"))
-        tax = taxable * settings.TAX_RATE if c.channel == "dine_in" else (taxable - fee) * settings.TAX_RATE
+        tlines = self.tax_lines(c, sub, disc)
+        tax = sum(t["amount"] for t in tlines)
         due = taxable + tax
         paid = sum(p["amount"] for p in c.payments)
         tips = sum(p.get("tip", 0.0) for p in c.payments)
         refunded = sum(r["amount"] for r in c.refunds)
-        return {"subtotal": _r(sub), "discounts": _r(disc), "tax": _r(tax), "due": _r(due), "paid": _r(paid), "tips": _r(tips),
-                "refunded": _r(refunded), "balance": _r(max(0.0, due - paid))}
+        return {"subtotal": _r(sub), "discounts": _r(disc), "tax": _r(tax), "tax_lines": tlines, "due": _r(due), "paid": _r(paid),
+                "tips": _r(tips), "refunded": _r(refunded), "balance": _r(max(0.0, due - paid))}
 
     def view(self, c: Check) -> dict:
         d = asdict(c)
@@ -91,9 +116,10 @@ class Payments:
             raise PaymentError(f"unknown check {check_id}")
         return c
 
-    def _record(self, c: Check, kind: str, amount: float, tip: float = 0.0, method: str = "", note: str = "") -> None:
-        self.svc.conn.execute("INSERT INTO payments (service_id, check_id, ts, kind, amount, tip, method, note) VALUES (?,?,?,?,?,?,?,?)",
-                              (self.svc.service_id, c.check_id, self.svc.clock.iso(), kind, _r(amount), _r(tip), method, note))
+    def _record(self, c: Check, kind: str, amount: float, tip: float = 0.0, method: str = "", note: str = "", ref: str | None = None) -> None:
+        self.svc.conn.execute("INSERT INTO payments (service_id, check_id, ts, kind, amount, tip, method, note, processor_ref) "
+                              "VALUES (?,?,?,?,?,?,?,?,?)", (self.svc.service_id, c.check_id, self.svc.clock.iso(), kind, _r(amount),
+                                                             _r(tip), method, note, ref))
 
     def publish(self, c: Check) -> None:
         self.svc.bus.publish(E.CHECK_UPDATED, self.view(c), source="payments")
@@ -162,7 +188,7 @@ class Payments:
         return self.view(c)
 
     def pay(self, check_id: str, amount: float, tip: float = 0.0, method: str = "card", split_index: int | None = None,
-            publish: bool = True) -> dict:
+            publish: bool = True, token: str | None = None, gift_code: str | None = None) -> dict:
         c = self._get(check_id)
         if c.status != "open":
             raise PaymentError(f"check {check_id} is {c.status}")
@@ -174,19 +200,55 @@ class Payments:
         bal = self.totals(c)["balance"]
         if amount > bal + 0.01:
             raise PaymentError(f"amount {amount:.2f} exceeds the balance {bal:.2f}")
+        if split_index is not None and (not (0 <= split_index < len(c.splits)) or c.splits[split_index]["paid"]):
+            raise PaymentError("invalid or already paid split")
+        ref = self._take_money(c, method, amount, tip, token, gift_code)
         if split_index is not None:
-            if not (0 <= split_index < len(c.splits)) or c.splits[split_index]["paid"]:
-                raise PaymentError("invalid or already paid split")
             c.splits[split_index]["paid"] = True
-        c.payments.append({"amount": _r(amount), "tip": _r(tip), "method": method, "at": self.svc.clock.hhmm(), "split": split_index})
+        c.payments.append({"amount": _r(amount), "tip": _r(tip), "method": method, "at": self.svc.clock.hhmm(), "split": split_index,
+                           "ref": ref})
         self.collected += amount
         self.tips += tip
-        self._record(c, "payment", amount, tip, method)
+        self._record(c, "payment", amount, tip, method, ref=ref)
         if self.totals(c)["balance"] <= 0.009:
             self._close(c)
         if publish:
             self.publish(c)
         return self.view(c)
+
+    def _take_money(self, c: Check, method: str, amount: float, tip: float, token: str | None, gift_code: str | None) -> str | None:
+        """Move the money: card / wallet / online through the processor, gift card from its balance, points from the
+        guest's loyalty balance; cash needs nothing. Returns the external reference."""
+        from restaurant_ops.live import giftcards as GC
+        from restaurant_ops.live.processor import ProcessorError
+
+        if method in PROCESSOR_METHODS:
+            try:
+                return self.svc.processor.charge(amount + tip, settings.CURRENCY, token, f"{self.svc.service_id} {c.check_id}")["id"]
+            except ProcessorError as e:
+                raise PaymentError(str(e)) from e
+        if method == "gift_card":
+            if not gift_code:
+                raise PaymentError("gift card code required")
+            if tip:
+                raise PaymentError("tips can't go on a gift card")
+            with self.svc.master() as m:
+                try:
+                    GC.redeem(m, gift_code, amount, ref=c.check_id, service_id=self.svc.service_id)
+                except GC.GiftCardError as e:
+                    raise PaymentError(str(e)) from e
+            return f"gc:{gift_code.strip().upper()}"
+        if method == "points":
+            if not c.guest_id:
+                raise PaymentError("points need a guest profile on the check")
+            value = float(self.svc.profile.get("loyalty", {}).get("redeem_value_per_point", 0.01))
+            need = int(round(amount / value)) if value else 10 ** 9
+            g = self.svc.crm.get(c.guest_id)
+            if g is None or g["points"] < need:
+                raise PaymentError(f"needs {need} points; the guest has {g['points'] if g else 0}")
+            self.svc.crm.spend_points(c.guest_id, need)
+            return f"pts:{need}"
+        return None
 
     def _close(self, c: Check) -> None:
         c.status, c.closed_t = "paid", self.svc.clock.t
@@ -197,14 +259,18 @@ class Payments:
                                       p.size if p else 1, [l["dish_id"] for l in c.lines if l.get("dish_id")])
         self.svc.on_check_paid(c)
 
-    def discount(self, check_id: str, reason: str, pct: float | None = None, amount: float | None = None, by: str = "manager") -> dict:
+    def discount(self, check_id: str, reason: str, pct: float | None = None, amount: float | None = None, by: str = "manager",
+                 role: str = "manager") -> dict:
         c = self._get(check_id)
         if c.status != "open":
             raise PaymentError(f"check {check_id} is {c.status}")
         t = self.totals(c)
         amt = float(amount) if amount is not None else t["subtotal"] * float(pct or 0) / 100
         already = sum(d["amount"] for d in c.discounts)
-        self._guard("discount", {"check_id": check_id, "amount": amt + already, "subtotal": t["subtotal"], "reason": reason})
+        caps = getattr(self.svc, "profile", {}).get("discount_max_pct", {}) if hasattr(self.svc, "profile") else {}
+        cap = float(caps.get(role, caps.get("manager", settings.DISCOUNT_MAX_PCT))) if role != "admin" else float(caps.get("manager", 100))
+        self._guard("discount", {"check_id": check_id, "amount": amt + already, "subtotal": t["subtotal"], "reason": reason,
+                                 "max_pct": cap})
         c.discounts.append({"amount": _r(amt), "reason": reason, "by": by, "at": self.svc.clock.hhmm()})
         self.discounted += amt
         self._record(c, "discount", amt, note=reason)
@@ -221,13 +287,34 @@ class Payments:
         c = self._get(check_id)
         t = self.totals(c)
         self._guard("refund", {"check_id": check_id, "amount": float(amount), "paid": t["paid"] - t["refunded"], "reason": reason})
-        c.refunds.append({"amount": _r(amount), "reason": reason, "by": by, "at": self.svc.clock.hhmm()})
+        ref = self._return_money(c, float(amount))
+        c.refunds.append({"amount": _r(amount), "reason": reason, "by": by, "at": self.svc.clock.hhmm(), "ref": ref})
         self.refunded += float(amount)
         if self.totals(c)["refunded"] >= t["paid"] - 0.009:
             c.status = "refunded"
-        self._record(c, "refund", float(amount), note=reason)
+        self._record(c, "refund", float(amount), note=reason, ref=ref)
         self.publish(c)
         return self.view(c)
+
+    def _return_money(self, c: Check, amount: float) -> str | None:
+        """Refund to the most recent payment's instrument (processor refund, gift card credit, or cash)."""
+        from restaurant_ops.live import giftcards as GC
+        from restaurant_ops.live.processor import ProcessorError
+
+        last = next((p for p in reversed(c.payments) if p.get("method") != "points"), None)
+        if last is None:
+            return None
+        ref = last.get("ref") or ""
+        if last["method"] in PROCESSOR_METHODS and ref:
+            try:
+                return self.svc.processor.refund(ref, amount)["id"]
+            except ProcessorError as e:
+                raise PaymentError(str(e)) from e
+        if last["method"] == "gift_card" and ref.startswith("gc:"):
+            with self.svc.master() as m:
+                GC.credit(m, ref[3:], amount, ref=c.check_id, service_id=self.svc.service_id)
+            return ref
+        return "cash"
 
     def _guard(self, action_type: str, payload: dict) -> None:
         self.svc.flush()
@@ -274,14 +361,14 @@ class Driver:
 class Dispatcher:
     """Drivers take ready delivery orders first come, first served; a trip is out and back (2 x drive time)."""
 
-    def __init__(self, n: int):
+    def __init__(self, n: int, zones: dict | None = None):
         self.drivers = [Driver(f"D{i + 1}") for i in range(max(1, n))]
+        self.zones = dict(zones or settings.DELIVERY_ZONES)
 
-    @staticmethod
-    def zone(z: str) -> dict:
-        if z not in settings.DELIVERY_ZONES:
-            raise PaymentError(f"delivery zone must be one of {', '.join(settings.DELIVERY_ZONES)}")
-        return settings.DELIVERY_ZONES[z]
+    def zone(self, z: str) -> dict:
+        if z not in self.zones:
+            raise PaymentError(f"delivery zone must be one of {', '.join(self.zones)}")
+        return self.zones[z]
 
     def driver_wait_min(self, at_t: float) -> float:
         return max(0.0, (min(d.free_t for d in self.drivers) - at_t) / 60)

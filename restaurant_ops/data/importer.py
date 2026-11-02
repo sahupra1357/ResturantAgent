@@ -1,4 +1,6 @@
-"""Import real POS history: map a POS export (CSV, one row per item sold) onto `covers` and `pos_sales`.
+"""Importers for onboarding a real restaurant: POS history, the menu (dishes + recipes) and stock counts.
+
+POS history: map a POS export (CSV, one row per item sold) onto `covers` and `pos_sales`.
 
     python -m restaurant_ops.data.importer sales.csv --db data/restaurant.db [--items-map map.csv]
            [--columns '{"opened_at": "Time", "item": "Menu Item"}'] [--replace] [--set-sim-start] [--dry-run]
@@ -170,9 +172,108 @@ def import_pos(path: "str | Path", db: "str | Path | None" = None, columns: dict
     return summary
 
 
+# =========================================================================== menu and inventory imports
+
+
+def import_menu(path: "str | Path", db: "str | Path | None" = None, dry_run: bool = False) -> dict:
+    """Menu CSV: id,name,category,price,station,prep_minutes,recipe[,tax_category,is_cold,seasonal_months]
+    where recipe is 'ingredient_id:qty;ingredient_id:qty'. Each row goes through admin validation (stations,
+    ingredients, price above food cost); invalid rows are reported and skipped."""
+    from restaurant_ops import admin as A
+
+    import tempfile
+
+    from restaurant_ops.db.connection import copy_db
+
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        rows = list(csv.DictReader(f))
+    target = Path(db or settings.DB_PATH)
+    tmpdir = None
+    if dry_run:  # validate against a throw-away copy: the admin layer commits each saved dish
+        tmpdir = tempfile.TemporaryDirectory()
+        target = copy_db(target, Path(tmpdir.name) / "dry.db") if target.exists() else Path(tmpdir.name) / "dry.db"
+    conn = get_conn(target)
+    ok, errors = [], []
+    try:
+        init_db(conn)
+        A.seed_defaults(conn)
+        for n, r in enumerate(rows, start=2):
+            try:
+                recipe = []
+                for part in (r.get("recipe") or "").split(";"):
+                    if part.strip():
+                        ing, _, q = part.partition(":")
+                        recipe.append({"ingredient_id": ing.strip(), "qty_per_portion": float(q)})
+                dish = {"id": r["id"].strip(), "name": r["name"].strip(), "category": r["category"].strip(),
+                        "price": float(r["price"]), "station": r["station"].strip(), "prep_minutes": float(r["prep_minutes"]),
+                        "recipe": recipe, "tax_category": (r.get("tax_category") or "food").strip(),
+                        "is_cold": (r.get("is_cold") or "").strip().lower() in ("1", "true", "yes"),
+                        "seasonal_months": r.get("seasonal_months") or ""}
+                A.save_dish(conn, dish)
+                ok.append(dish["id"])
+            except (KeyError, ValueError) as e:
+                errors.append({"line": n, "id": r.get("id"), "error": str(e)})
+    finally:
+        conn.close()
+        if tmpdir is not None:
+            tmpdir.cleanup()
+    return {"imported": ok, "errors": errors, "dry_run": dry_run}
+
+
+def import_inventory(path: "str | Path", db: "str | Path | None" = None, as_of: str | None = None, replace: bool = False,
+                     dry_run: bool = False) -> dict:
+    """Stock CSV (a stock take or a delivery): ingredient,qty[,unit_cost,expiry_date,received_date,supplier_id,lot_id].
+    `ingredient` is an id or a name. Missing expiry uses the ingredient's shelf life; missing cost its reference cost.
+    replace=True retires the existing active lots of every ingredient in the file first (a full count)."""
+    import uuid
+
+    day = date.fromisoformat(as_of) if as_of else settings.SIM_START
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        rows = list(csv.DictReader(f))
+    conn = get_conn(db or settings.DB_PATH)
+    lots, errors = [], []
+    try:
+        init_db(conn)
+        ings = {r["id"]: dict(r) for r in conn.execute("SELECT * FROM ingredients")}
+        by_name = {v["name"].lower(): k for k, v in ings.items()}
+        for n, r in enumerate(rows, start=2):
+            key = (r.get("ingredient") or "").strip()
+            iid = key if key in ings else by_name.get(key.lower())
+            try:
+                if iid is None:
+                    raise ValueError(f"unknown ingredient {key!r}")
+                qty = float(r["qty"])
+                if qty <= 0:
+                    raise ValueError("qty must be > 0")
+                ing = ings[iid]
+                received = date.fromisoformat(r["received_date"]) if r.get("received_date") else day
+                expiry = date.fromisoformat(r["expiry_date"]) if r.get("expiry_date") else received + timedelta(days=int(ing["shelf_life_days"]))
+                if expiry < received:
+                    raise ValueError("expiry_date before received_date")
+                cost = float(r["unit_cost"]) if r.get("unit_cost") else float(ing["ref_cost"])
+                lots.append((r.get("lot_id") or f"IMP-{uuid.uuid4().hex[:8]}", iid, qty, received.isoformat(), expiry.isoformat(),
+                             r.get("supplier_id") or None, cost, "active"))
+            except (KeyError, ValueError) as e:
+                errors.append({"line": n, "ingredient": key, "error": str(e)})
+        if not dry_run and lots:
+            if replace:
+                ids = sorted({l[1] for l in lots})
+                conn.execute(f"UPDATE lots SET status='depleted', qty=0 WHERE status='active' AND ingredient_id IN ({','.join('?' * len(ids))})", ids)
+            conn.executemany("INSERT OR REPLACE INTO lots (lot_id, ingredient_id, qty, received_date, expiry_date, supplier_id, unit_cost, status) "
+                             "VALUES (?,?,?,?,?,?,?,?)", lots)
+            conn.commit()
+    finally:
+        conn.close()
+    return {"lots": len(lots), "ingredients": sorted({l[1] for l in lots}), "value": round(sum(l[2] * l[6] for l in lots), 2),
+            "errors": errors, "replace": replace, "dry_run": dry_run}
+
+
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="Import POS history (CSV) into covers / pos_sales")
+    ap = argparse.ArgumentParser(description="Import POS history (default), a menu or a stock count from CSV")
     ap.add_argument("csv")
+    ap.add_argument("--kind", choices=["pos", "menu", "inventory"], default="pos")
+    ap.add_argument("--as-of", default=None, help="inventory: the count / delivery date (default: first live day)")
+    ap.add_argument("--replace-stock", action="store_true", help="inventory: retire existing lots of the listed ingredients")
     ap.add_argument("--db", default=str(settings.DB_PATH))
     ap.add_argument("--items-map", default=None, help="CSV with columns pos_item,dish_id")
     ap.add_argument("--columns", default=None, help="JSON mapping of our column names to the export's")
@@ -180,6 +281,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--set-sim-start", action="store_true", help="make the day after the last imported day the first live day")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args(argv)
+    if a.kind == "menu":
+        print(json.dumps(import_menu(a.csv, a.db, a.dry_run), indent=2))
+        return 0
+    if a.kind == "inventory":
+        print(json.dumps(import_inventory(a.csv, a.db, a.as_of, a.replace_stock, a.dry_run), indent=2))
+        return 0
     try:
         out = import_pos(a.csv, a.db, json.loads(a.columns) if a.columns else None, a.items_map, not a.no_replace,
                          a.set_sim_start, a.dry_run)
