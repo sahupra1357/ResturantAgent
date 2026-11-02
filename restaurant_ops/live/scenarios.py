@@ -41,7 +41,9 @@ def salmon_short(svc: "Service") -> dict:
 
 
 def cooler_failure(svc: "Service") -> dict:
-    return svc.inventory.cooler_failure("dairy")
+    """The walk-in fails: the next sensor reading is out of range -> temp.alert -> Inventory quarantines and asks to discard."""
+    reading = svc.safety.fail("walk_in")["walk_in"]
+    return {"unit": "walk_in", "temp_c": reading["temp_c"], "ok": reading["ok"]}
 
 
 def heatwave(svc: "Service") -> dict:

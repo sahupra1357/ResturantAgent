@@ -1,5 +1,7 @@
 """Procurement agent: on stock.low (and supplier shortfalls) it checks open POs and lead times, compares supplier
-quotes and drafts a PO; on a forecast miss it re-runs the order optimizer for tomorrow.
+quotes, negotiates with the supplier's vendor agent (sim/vendors.py) and drafts a PO; on a forecast miss it re-runs
+the order optimizer for tomorrow. Supplier reliability is learned: the scorecard blends catalog priors with the PO
+history at service start, and every shortfall lowers that supplier's fill rate (core/suppliers.py).
 
 POs above LIVE_PO_APPROVAL_THRESHOLD go to the manager (timeout: no PO is sent). When the manager rejects with a
 reason, the agent re-plans: a cost / budget reason -> a cheaper, smaller order that fits under the threshold;
@@ -34,6 +36,7 @@ class ProcurementAgent(LiveAgent):
         super().__init__(svc)
         self.handled: dict[str, dict] = {}   # ingredient -> {replans, excluded, decision_id}
         svc.bus.subscribe(E.STOCK_LOW, self.on_low, "procurement.on_low")
+        svc.bus.subscribe(E.SUPPLIER_SHORTFALL, self.on_shortfall, "procurement.on_shortfall")
 
     # ------------------------------------------------------------------ numbers
     def _gap(self, ing: str, trace: list, days: int = 2, quantile: str = "p90") -> dict:
@@ -67,10 +70,23 @@ class ProcurementAgent(LiveAgent):
         ok = [q for q in qs if q["meets_deadline"]]
         return ok[0] if ok else min(qs, key=lambda q: (q["earliest_delivery"], q["risk_adjusted_price"]))
 
+    def _negotiate(self, ing: str, q: dict, qty: float, trace: list) -> tuple[float, str]:
+        """Ask the supplier's vendor agent for NEGOTIATE_TARGET x list on lines worth NEGOTIATE_MIN_LINE or more."""
+        price = q["unit_price"]
+        if qty * price < settings.NEGOTIATE_MIN_LINE:
+            return price, ""
+        res = self.tool(trace, "negotiate", supplier_id=q["supplier_id"], ingredient_id=ing, qty=qty,
+                        target_price=round(price * settings.NEGOTIATE_TARGET, 3))
+        cp = res.get("counter_price") if isinstance(res, dict) else None
+        if isinstance(cp, (int, float)) and 0 < cp < price:
+            return float(cp), f"negotiated {price:.2f} -> {cp:.2f} ({(1 - cp / price) * 100:.1f}% off): {res.get('message', '')}"
+        return price, f"no discount from {q['supplier']}: {res.get('message', '') if isinstance(res, dict) else ''}"
+
     def _po(self, ing: str, q: dict, qty: float, why: str, trace: list, gap: dict, replan: int = 0, cap: float | None = None):
-        price, pack = q["unit_price"], q["pack_size"]
+        pack = q["pack_size"]
         need = max(qty, 0.0)
         qty = _packs(need, pack)
+        price, neg = self._negotiate(ing, q, qty, trace)
         if qty * price < q["min_order_value"]:
             qty = _packs(q["min_order_value"] / price, pack)
             if qty > need * MIN_ORDER_OVERBUY + pack:
@@ -79,19 +95,36 @@ class ProcurementAgent(LiveAgent):
             qty = math.floor(cap / price / pack) * pack
             if qty <= 0 or qty * price < q["min_order_value"]:
                 return None
-        lines = [{"ingredient_id": ing, "qty": round(qty, 3), "unit_price": price}]
+        lines = [{"ingredient_id": ing, "qty": round(qty, 3), "unit_price": round(price, 3)}]
         po = self.tool(trace, "draft_po", supplier_id=q["supplier_id"], delivery_date=q["earliest_delivery"], lines=lines)
         ing_name = cat.INGREDIENTS_BY_ID[ing].name
         unit = cat.INGREDIENTS_BY_ID[ing].unit
         sup = q["supplier"]
         when = q["earliest_delivery"]
-        title = (f"{'Re-planned ' if replan else ''}PO: {qty:g} {unit} {ing_name} from {sup} (${po['total']:.2f}), "
-                 f"delivers {when}")
+        title = (f"{'Re-planned ' if replan else ''}PO: {qty:g} {unit} {ing_name} from {sup} (${po['total']:.2f}"
+                 f"{', negotiated' if price < q['unit_price'] else ''}), delivers {when}")
         return self.proposal("place_po", {k: po[k] for k in ("supplier_id", "delivery_date", "lines", "total")},
-                             title, why, trace, key=f"po:{ing}", confidence=0.8 if not replan else 0.75,
+                             title, why + (f"; {neg}" if neg else ""), trace, key=f"po:{ing}", confidence=0.8 if not replan else 0.75,
                              timeout_default="reject", force=bool(replan), est_cost=po["total"],
                              context={"ingredient_id": ing, "gap": {k: v for k, v in gap.items() if k != "open_pos"},
-                                      "replan": replan})
+                                      "replan": replan, "list_price": q["unit_price"], "negotiated_price": price})
+
+    # ------------------------------------------------------------------ supplier learning
+    def start_of_service(self) -> None:
+        trace: list = []
+        rows = self.tool(trace, "supplier_scorecard")
+        worst = min(rows, key=lambda r: r["fill_rate"])
+        self.log("supplier scorecard from delivery history: " + ", ".join(
+            f"{r['supplier']} fill {r['fill_rate']:.0%}" + (f" ({r['observed_pos']} POs)" if r["observed_pos"] else "") for r in rows)
+            + f"; least reliable: {worst['supplier']}")
+
+    def on_shortfall(self, ev: E.Event) -> None:
+        p = ev.payload
+        res = self.tool(None, "learn_supplier", supplier_id=p["supplier_id"], kind="shortfall", fill=p["fill_rate"],
+                        note=f"{p['ingredient_id']} short: {p['fill_rate']:.0%} fill")
+        self.svc.bus.publish(E.SUPPLIER_LEARNED, {**res, "reason": f"{p['ingredient_id']} shortfall"}, source=self.name)
+        self.log(f"{p['supplier_id']} reliability updated after the shortfall: fill rate {res['fill_rate_before']:.0%} -> "
+                 f"{res['fill_rate']:.0%}; its quotes now carry a higher risk premium")
 
     # ------------------------------------------------------------------ triggers
     def on_low(self, ev: E.Event) -> None:

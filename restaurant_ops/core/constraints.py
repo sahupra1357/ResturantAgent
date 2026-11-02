@@ -19,6 +19,13 @@ An action is {"action_type", "payload", "rationale"?, "agent"?, "est_cost"?}. Pa
   throttle_online      {mode ('open'|'quick_only'|'paused'), reason}
   allergen_swap        {order_id, item_id, from_dish, to_dish (null = drop the item), guest_allergens:[str]}
   comp                 {order_id, amount, order_total, reason}
+  add_staff            {station, add, hours, hourly_rate, surge_spent}   (labour budget: SURGE_LABOR_BUDGET)
+  release_staff        {station, remove}
+  prep_batch           {dish_id, portions}
+  donate_lots          {lots:[{lot_id}], partner}
+  discount             {check_id, pct?|amount?, subtotal, reason}       (<= DISCOUNT_MAX_PCT)
+  refund               {check_id, amount, paid, reason}
+  price_change         {dish_id, new_price, reason}                    (<= +/-15%, effective next service)
 
 Rules (code -> severity): positive_quantities, supplier_carries_item, lead_time, min_order_value,
 budget_daily, budget_weekly, shelf_life, fefo, stock_available, allergen_undeclared, station_capacity
@@ -38,7 +45,10 @@ from restaurant_ops.core.util import to_date
 
 ACTION_TYPES = ("adjust_forecast", "place_po", "reschedule_po", "substitute_supplier", "add_special",
                 "86_dish", "substitute_ingredient", "prep_list", "discard_lot", "flag_variance",
-                "discard_lots", "throttle_online", "allergen_swap", "comp")
+                "discard_lots", "throttle_online", "allergen_swap", "comp", "add_staff", "release_staff",
+                "prep_batch", "donate_lots", "discount", "refund", "price_change")
+STAFF_STATIONS = ("grill", "saute", "cold", "pastry")
+MAX_PRICE_CHANGE = 0.15
 ONLINE_MODES = ("open", "quick_only", "paused")
 MAX_COMP_SHARE = 0.5  # a comp may not exceed half the order total
 FORECAST_FACTOR_RANGE = (0.5, 1.6)
@@ -513,13 +523,120 @@ def _check_comp(a, p, conn, as_of, out):
         out.append(Violation("comp_too_large", f"comp {amt:.2f} exceeds {MAX_COMP_SHARE:.0%} of the order total {tot:.2f}"))
 
 
+def _check_add_staff(a, p, conn, as_of, out):
+    if _missing(p, ["station", "add", "hours", "hourly_rate"], out):
+        return
+    if p["station"] not in STAFF_STATIONS:
+        out.append(Violation("unknown_station", f"unknown station {p['station']}"))
+    add, hours, rate = _num(p["add"], 0) or 0, _num(p["hours"], 0) or 0, _num(p["hourly_rate"], 0) or 0
+    if add <= 0 or hours <= 0 or rate <= 0:
+        out.append(Violation("positive_quantities", "add, hours and hourly_rate must be > 0"))
+        return
+    cost = add * hours * rate
+    spent = _num(p.get("surge_spent"), 0) or 0
+    budget = default_settings.SURGE_LABOR_BUDGET
+    if spent + cost > budget + 1e-9:
+        out.append(Violation("labor_budget", f"call-in costs {cost:.0f}; with {spent:.0f} already spent tonight that exceeds "
+                                             f"the surge labour budget {budget:.0f}"))
+    if add > default_settings.MAX_EXTRA_COOKS:
+        out.append(Violation("max_extra_cooks", f"at most {default_settings.MAX_EXTRA_COOKS} extra cook(s) per station"))
+
+
+def _check_release_staff(a, p, conn, as_of, out):
+    if _missing(p, ["station", "remove"], out):
+        return
+    if (_num(p["remove"], 0) or 0) <= 0:
+        out.append(Violation("positive_quantities", "remove must be > 0"))
+
+
+def _check_prep_batch(a, p, conn, as_of, out):
+    if _missing(p, ["dish_id", "portions"], out):
+        return
+    d = _dish(conn, p["dish_id"])
+    if d is None:
+        out.append(Violation("unknown_dish", f"dish {p['dish_id']} does not exist"))
+        return
+    n = _num(p["portions"], 0) or 0
+    if n <= 0:
+        out.append(Violation("positive_quantities", "portions must be > 0"))
+        return
+    feasible = menu.feasible_portions(p["dish_id"], as_of.isoformat(), conn)
+    if feasible < n:
+        out.append(Violation("stock_available", f"stock supports only {feasible} portions of {d['name']}, prep asks {int(n)}"))
+
+
+def _check_donate_lots(a, p, conn, as_of, out):
+    lots = p.get("lots")
+    if not lots:
+        out.append(Violation("missing_field", "payload is missing: lots"))
+        return
+    for lot in lots:
+        lid = lot["lot_id"] if isinstance(lot, dict) else lot
+        r = conn.execute("SELECT status, expiry_date FROM lots WHERE lot_id=?", (lid,)).fetchone()
+        if r is None or r["status"] != "active":
+            out.append(Violation("lot_not_found", f"lot {lid} does not exist or is not active"))
+        elif to_date(r["expiry_date"]) < as_of:
+            out.append(Violation("lot_expired", f"lot {lid} expired on {r['expiry_date']}: it may not be donated"))
+    if not str(p.get("partner", "")).strip():
+        out.append(Violation("missing_field", "donation needs a partner"))
+
+
+def _check_discount(a, p, conn, as_of, out):
+    if _missing(p, ["check_id", "subtotal"], out):
+        return
+    sub = _num(p["subtotal"], 0) or 0
+    amt = _num(p.get("amount"))
+    if amt is None:
+        amt = sub * (_num(p.get("pct"), 0) or 0) / 100
+    if amt <= 0:
+        out.append(Violation("positive_quantities", "discount must be > 0"))
+    elif sub and amt / sub * 100 > default_settings.DISCOUNT_MAX_PCT + 1e-9:
+        out.append(Violation("discount_too_large", f"discount {amt:.2f} is {amt / sub * 100:.0f}% of the bill "
+                                                   f"(max {default_settings.DISCOUNT_MAX_PCT:.0f}%)"))
+    if not str(p.get("reason", "")).strip():
+        out.append(Violation("missing_reason", "a discount needs a reason"))
+
+
+def _check_refund(a, p, conn, as_of, out):
+    if _missing(p, ["check_id", "amount"], out):
+        return
+    amt, paid = _num(p["amount"], 0) or 0, _num(p.get("paid"), 0) or 0
+    if amt <= 0:
+        out.append(Violation("positive_quantities", "refund must be > 0"))
+    elif amt > paid + 1e-9:
+        out.append(Violation("refund_exceeds_paid", f"refund {amt:.2f} exceeds the {paid:.2f} paid on the check"))
+    if not str(p.get("reason", "")).strip():
+        out.append(Violation("missing_reason", "a refund needs a reason"))
+
+
+def _check_price_change(a, p, conn, as_of, out):
+    if _missing(p, ["dish_id", "new_price"], out):
+        return
+    d = _dish(conn, p["dish_id"])
+    if d is None:
+        out.append(Violation("unknown_dish", f"dish {p['dish_id']} does not exist"))
+        return
+    new = _num(p["new_price"], 0) or 0
+    old = float(d["price"])
+    if new <= 0:
+        out.append(Violation("positive_quantities", "new_price must be > 0"))
+        return
+    if abs(new / old - 1) > MAX_PRICE_CHANGE + 1e-9:
+        out.append(Violation("price_step", f"{d['name']}: {old:.2f} -> {new:.2f} is more than {MAX_PRICE_CHANGE:.0%}"))
+    fc = menu.margin_calc(p["dish_id"], conn=conn)["food_cost"]
+    if new < fc:
+        out.append(Violation("negative_margin", f"price {new:.2f} is below food cost {fc:.2f}"))
+
+
 _CHECKS = {
     "place_po": _check_place_po, "reschedule_po": _check_reschedule_po,
     "substitute_supplier": _check_substitute_supplier, "add_special": _check_add_special,
     "86_dish": _check_86, "substitute_ingredient": _check_substitute_ingredient, "prep_list": _check_prep_list,
     "discard_lot": _check_discard_lot, "adjust_forecast": _check_adjust_forecast, "flag_variance": _check_flag_variance,
     "discard_lots": _check_discard_lots, "throttle_online": _check_throttle_online,
-    "allergen_swap": _check_allergen_swap, "comp": _check_comp,
+    "allergen_swap": _check_allergen_swap, "comp": _check_comp, "add_staff": _check_add_staff,
+    "release_staff": _check_release_staff, "prep_batch": _check_prep_batch, "donate_lots": _check_donate_lots,
+    "discount": _check_discount, "refund": _check_refund, "price_change": _check_price_change,
 }
 
 

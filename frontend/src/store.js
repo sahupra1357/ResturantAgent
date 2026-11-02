@@ -6,10 +6,14 @@ import { useEffect, useReducer, useRef, useState } from 'react'
 export const FEED_SKIP = new Set([
   'clock.tick', 'kitchen.load', 'inventory.snapshot', 'kpi.updated', 'table.updated', 'quote.updated',
   'menu.updated', 'online.order', 'item.fired', 'item.done', 'order.submitted', 'service.started', 'forecast.updated',
+  'host.updated', 'check.updated', 'prep.updated', 'safety.updated',
 ])
 const FEED_MAX = 250
 
-export const initialState = { connected: false, ready: false, feed: [], decisions: {}, tables: {}, online: { mode: 'open', orders: {} } }
+export const initialState = {
+  connected: false, ready: false, feed: [], decisions: {}, tables: {}, online: { mode: 'open', orders: {} },
+  host: { bookings: [], waitlist: [] }, checks: {},
+}
 
 function feedEntry(ev) {
   return { seq: ev.seq, type: ev.type, source: ev.source, sim_ts: ev.sim_ts, payload: ev.payload }
@@ -43,6 +47,10 @@ export function applyEvent(s, ev) {
       n = { ...s, decisions: { ...s.decisions, [p.id]: { ...p, receivedAt: Date.now() } } }
       break
     case 'kpi.updated': n = { ...s, kpis: p }; break
+    case 'host.updated': n = { ...s, host: p }; break
+    case 'check.updated': n = { ...s, checks: { ...(s.checks || {}), [p.check_id]: p } }; break
+    case 'prep.updated': n = { ...s, prep: p }; break
+    case 'safety.updated': n = { ...s, safety: p }; break
     case 'service.ended':
       n = { ...s, kpis: p.kpis, service: { ...s.service, status: 'ended' }, forecastError: p.forecast_error }
       break

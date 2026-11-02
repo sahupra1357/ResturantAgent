@@ -27,12 +27,13 @@ Contents
 25. [Settings](#settings)
 26. [Database tables](#database-tables)
 27. [Running it](#running-it)
+28. [Round 2: operations depth](#round-2-operations-depth)
 
 # Restaurant Ops Agents
 
 A walkthrough of the whole codebase in `ResturantAgent/`: what each part does, what goes in and comes out, and how a live dinner service and a simulated week flow through the system.
 
-Python **3.12** · \~12,000 lines of Python + \~1,100 lines of React · tests **66 passed, 2 skipped** (the skips need a Redis server) · LLM default **meta** provider, rule-based "mock" agents without a key
+Python **3.12** · \~16,000 lines of Python + \~2,000 lines of React · tests **99 passed** backend (Redis tests included when a server is running) + **13** frontend (vitest) · LLM default **meta** provider, rule-based "mock" agents without a key
 
 ## The short version
 
@@ -810,7 +811,7 @@ Files on disk: `data/restaurant.db` (seeded world), `data/live/{service_id}.db` 
 
 ## Running it
 
-Everything has now been run: the full test suite passes in mock mode (66 passed, 2 skipped because no Redis server was running), and the headless salmon-short demo above completes with the expected decisions. Live LLM mode hasn't been exercised against a real provider in the tests.
+Everything has now been run: the full test suite passes in mock mode (99 backend tests with a Redis server running, 13 frontend tests), and the headless salmon-short demo above completes with the expected decisions. Live LLM mode hasn't been exercised against a real provider in the tests.
 
 ```
 uv sync
@@ -833,3 +834,24 @@ uv run python -m restaurant_ops.sim.run --days 7 --policy both --scenario all --
 - **Live LLM mode quiet failures:** if the provider rejects tool calling or structured output, the live review falls back to rule-based proposals and logs "LLM review failed" in the agent log; batch agents return empty reports with `error: ...` in findings.
 - **Cost of a batch week in live LLM mode:** 7 morning cycles × 5 agents plus 4 event cycles, roughly 50 agent runs of up to 8 tool steps each. Try `--days 1` first.
 - **Synthetic data only.** Prices, demand and the demo numbers come from the seeded world, not real-world figures.
+
+
+## Round 2: operations depth
+
+A second round closed the gaps between a demo and something a restaurant could pilot. Each part lives in its own
+module and is covered by `tests/test_live_round2.py` (31 tests) and the frontend's vitest suite.
+
+| Area | Where | What it adds |
+| --- | --- | --- |
+| Prep & staffing agent (6th) | `live/agents/prep.py`, `live/kitchen.py` | Mise en place from the forecast prep list, burned down as items fire (none left = cooked from scratch, 30% slower, and quotes know it); prep batches; call a cook in when a station stays behind (labour budget enforced by the constraint checker), release when calm |
+| Negotiation + supplier learning | `live/agents/procurement.py`, `core/suppliers.py` | Emergency PO lines are negotiated with the vendor agent; fill rates blend priors with PO history and drop on every shortfall, so quotes price the risk |
+| Auth & roles | `live/server.py` | Manager / server / kitchen bearer tokens on every mutating endpoint; reads, the public online page and the WebSocket stay open |
+| Persistence | `live/persistence.py`, `live/coordinator.py` | SQLite checkpoints for approval interrupts + pickled service state; `Service.resume` continues a dinner after a restart with pending approvals intact |
+| Host stand | `live/host.py` | Bookings (create / cancel / no-show / arrive), overbooking control, waitlist with quoted waits, move / combine / split tables |
+| Payments & delivery | `live/payments.py` | Checks, even or by-seat splits, tips, discounts and refunds through the constraint checker; prepaid online orders; delivery zones, fees and driver dispatch |
+| Guest profiles | `live/crm.py` | Persistent allergies applied to every linked order automatically, visit history, loyalty points and tiers |
+| Food safety & waste | `live/safety.py` | Temperature log with alerts (the cooler-failure scenario now comes from a sensor reading), HACCP checklist, configurable expiry lead time, donations, waste analytics |
+| Menu engineering | `core/menu_engineering.py` | Star / plowhorse / puzzle / dog, price suggestions under a stated elasticity assumption (price changes need approval and apply next service), seasonal rotation |
+| POS import | `data/importer.py` | CSV → `covers` / `pos_sales` with item mapping (file, id, name, fuzzy), meal periods, unmapped report, dry run |
+| Operability | `live/ops.py`, `config.py` | JSON logs, Prometheus `/metrics`, retention of old service files, all tunables in settings, approval timeouts in service minutes, Redis failure → in-process fallback |
+| Frontend | `frontend/src` | 3D dining floor (three.js) with guests walking in, sitting, waiting and leaving; dashboard tabs; approval alerts; sign-in; end-of-service report (HTML / CSV); vitest tests |

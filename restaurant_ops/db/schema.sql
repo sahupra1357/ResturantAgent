@@ -273,3 +273,93 @@ CREATE TABLE IF NOT EXISTS quote_log (
 );
 
 CREATE INDEX IF NOT EXISTS idx_event_log_type ON event_log(service_id, type);
+
+-- Bookings taken by the host stand during a live service (the `reservations` table stays the forecasting input).
+CREATE TABLE IF NOT EXISTS bookings (
+    booking_id TEXT PRIMARY KEY,
+    service_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    phone TEXT,
+    party_size INTEGER NOT NULL,
+    time TEXT NOT NULL,              -- HH:MM
+    status TEXT NOT NULL,            -- booked | arrived | seated | no_show | cancelled
+    guest_id INTEGER,
+    notes TEXT,
+    source TEXT,                     -- sim | phone | web | walk_in
+    created_ts TEXT NOT NULL
+);
+
+-- Guest profiles: persistent allergies, preferences, visits and loyalty.
+CREATE TABLE IF NOT EXISTS guests (
+    guest_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    phone TEXT UNIQUE,
+    email TEXT,
+    allergies TEXT NOT NULL DEFAULT '',     -- comma list of allergens (e.g. 'nuts,milk')
+    preferences TEXT NOT NULL DEFAULT '',
+    notes TEXT NOT NULL DEFAULT '',
+    visits INTEGER NOT NULL DEFAULT 0,
+    total_spend REAL NOT NULL DEFAULT 0,
+    points INTEGER NOT NULL DEFAULT 0,
+    tier TEXT NOT NULL DEFAULT 'Member',
+    created TEXT NOT NULL,
+    last_visit TEXT
+);
+
+CREATE TABLE IF NOT EXISTS guest_visits (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guest_id INTEGER NOT NULL,
+    service_id TEXT NOT NULL,
+    date DATE NOT NULL,
+    party_size INTEGER,
+    spend REAL NOT NULL DEFAULT 0,
+    dishes TEXT NOT NULL DEFAULT ''
+);
+
+-- Checks and payments (dine-in bills, online prepayments, splits, tips, discounts, refunds).
+CREATE TABLE IF NOT EXISTS payments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    service_id TEXT NOT NULL,
+    check_id TEXT NOT NULL,
+    ts TEXT NOT NULL,
+    kind TEXT NOT NULL,              -- payment | refund | discount | comp
+    amount REAL NOT NULL,
+    tip REAL NOT NULL DEFAULT 0,
+    method TEXT,
+    note TEXT
+);
+
+-- Food safety: temperature log, HACCP checklist, donations of safe near-expiry stock.
+CREATE TABLE IF NOT EXISTS temp_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    service_id TEXT NOT NULL,
+    ts TEXT NOT NULL,
+    unit TEXT NOT NULL,
+    temp_c REAL NOT NULL,
+    ok INTEGER NOT NULL,
+    source TEXT NOT NULL DEFAULT 'sensor'
+);
+CREATE TABLE IF NOT EXISTS haccp_checks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    service_id TEXT NOT NULL,
+    item TEXT NOT NULL,
+    due TEXT NOT NULL,               -- HH:MM
+    done_ts TEXT,
+    done_by TEXT,
+    ok INTEGER,
+    note TEXT
+);
+CREATE TABLE IF NOT EXISTS donations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    date DATE NOT NULL,
+    lot_id TEXT NOT NULL,
+    ingredient_id TEXT NOT NULL,
+    qty REAL NOT NULL,
+    value REAL NOT NULL,
+    partner TEXT NOT NULL
+);
+-- Observed supplier performance (fill rate / delays), see core/suppliers.py.
+CREATE TABLE IF NOT EXISTS supplier_perf (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, supplier_id TEXT NOT NULL, ts TEXT NOT NULL, kind TEXT NOT NULL,
+    fill REAL, late INTEGER, weight REAL NOT NULL, fill_rate_after REAL, delay_prob_after REAL, note TEXT
+);

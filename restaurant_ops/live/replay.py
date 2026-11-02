@@ -82,6 +82,14 @@ def fold(events: list[dict], state: dict | None = None) -> dict:
             s["decisions"][str(p["id"])] = p
         elif t == E.KPI_UPDATED:
             s["kpis"] = p
+        elif t == E.HOST_UPDATED:
+            s["host"] = p
+        elif t == E.CHECK_UPDATED:
+            s.setdefault("checks", {})[p["check_id"]] = p
+        elif t == E.PREP_UPDATED:
+            s["prep"] = {k: v for k, v in p.items() if k != "reason"}
+        elif t == E.SAFETY_UPDATED:
+            s["safety"] = p
         elif t == E.SERVICE_ENDED:
             s["kpis"] = p["kpis"]
             s["service"]["status"] = "ended"

@@ -157,6 +157,9 @@ class ToolBox:
                                                                           qty=qty, needed_by=needed_by),
             "expected_usage": lambda **kw: fresh("expected_usage", **kw),
             "open_pos": lambda ingredient_id=None: s.open_pos(ingredient_id),
+            "negotiate": lambda **kw: R.negotiate(**kw),
+            "supplier_scorecard": lambda: s.supplier_scorecard(),
+            "learn_supplier": lambda supplier_id, kind, fill=None, late=None, note="": s.learn_supplier(supplier_id, kind, fill, late, note),
             "draft_po": lambda supplier_id, delivery_date, lines: {
                 "supplier_id": supplier_id, "delivery_date": delivery_date, "lines": lines,
                 "total": round(sum(float(l["qty"]) * float(l["unit_price"]) for l in lines), 2)},

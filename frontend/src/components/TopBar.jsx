@@ -1,11 +1,49 @@
-import { useState } from 'react'
-import { api } from '../api.js'
+import { useEffect, useState } from 'react'
+import { api, getToken, setToken } from '../api.js'
 
 const SPEEDS = [[0, '⏸'], [1, '1x'], [10, '10x'], [60, '60x']]
 
-export default function TopBar({ state, mode, setMode }) {
+function SignIn({ role, setRole }) {
+  const [open, setOpen] = useState(false)
+  const [tok, setTok] = useState(getToken())
+  const [err, setErr] = useState('')
+  const save = async (e) => {
+    e.preventDefault()
+    setToken(tok.trim())
+    try {
+      const r = await api.whoami()
+      if (tok.trim() && !r.role) { setErr('Token not recognised'); return }
+      setRole(r.role)
+      setOpen(false)
+      setErr('')
+    } catch (x) { setErr(x.message) }
+  }
+  return (
+    <>
+      <button onClick={() => setOpen(true)} aria-label="Sign in with a role token">{role ? `Signed in: ${role}` : 'Sign in'}</button>
+      {open && (
+        <div className="modal-back" onClick={() => setOpen(false)}>
+          <form className="modal narrow" onClick={(e) => e.stopPropagation()} onSubmit={save}>
+            <div className="modal-head"><h3>Role token</h3><button type="button" className="ghost" onClick={() => setOpen(false)} aria-label="Close">✕</button></div>
+            <p className="small muted">Manager: approvals, scenarios, clock, discounts, refunds, reports. Server: orders, bookings, waitlist, tables, checks, guests. Kitchen: HACCP and temperatures. Demo tokens are in config (MANAGER_TOKEN, SERVER_TOKEN, KITCHEN_TOKEN).</p>
+            <input autoFocus aria-label="Token" type="password" value={tok} onChange={(e) => setTok(e.target.value)} placeholder="paste a token" />
+            <div className="form-row">
+              <button className="primary" type="submit">Sign in</button>
+              <button type="button" onClick={() => { setTok(''); setToken(''); setRole(null); setOpen(false) }}>Sign out</button>
+            </div>
+            {err && <p className="err small">{err}</p>}
+          </form>
+        </div>
+      )}
+    </>
+  )
+}
+
+export default function TopBar({ state, mode, setMode, alerts }) {
   const [svcs, setSvcs] = useState(null)
   const [err, setErr] = useState('')
+  const [role, setRole] = useState(null)
+  useEffect(() => { api.whoami().then((r) => setRole(r.role)).catch(() => {}) }, [])
   const c = state.clock || {}
   const s = state.service || {}
   const replay = mode.kind === 'replay'
@@ -52,6 +90,8 @@ export default function TopBar({ state, mode, setMode }) {
           </>
         )}
         <a className="btn" href="#/online" target="_blank" rel="noreferrer">Online page ↗</a>
+        <button onClick={alerts.toggle} aria-pressed={alerts.on} title="Chime and desktop notification for new approvals">{alerts.on ? 'Alerts on' : 'Alerts off'}</button>
+        <SignIn role={role} setRole={setRole} />
       </div>
       {svcs && (
         <div className="modal-back" onClick={() => setSvcs(null)}>

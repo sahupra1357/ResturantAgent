@@ -10,16 +10,14 @@ from __future__ import annotations
 
 import time
 
+from restaurant_ops.config import settings
 from restaurant_ops.data import catalog as cat
 from restaurant_ops.live import events as E
 from restaurant_ops.live.agents.base import LiveAgent
 
-COURSE_GAP_MIN = 12.0       # mains fire this long after starters
 LARGE_PARTY = 8             # parties this big fire everything at once
-SLAMMED_STREAK_MIN = 4      # minutes slammed before asking to throttle online orders
-CALM_STREAK_MIN = 10        # minutes calm before reopening
-COMP_LATE_MIN = 10.0        # online order this late past the P90 quote -> propose a comp
 COMP_SHARE = 0.15
+# timing tunables live in config.Settings: COURSE_GAP_MIN, SLAMMED_STREAK_MIN, CALM_STREAK_MIN, COMP_LATE_MIN
 
 
 class OrderAgent(LiveAgent):
@@ -43,6 +41,12 @@ class OrderAgent(LiveAgent):
         trace: list = []
         notes = self.tool(trace, "parse_order", text=p.get("notes", ""))
         order_allergens = set(notes["allergens"])
+        profile = svc.crm.get(p["guest_id"]) if p.get("guest_id") else None
+        profile_allergens = set(profile["allergies"]) if profile else set()
+        if profile_allergens - order_allergens:
+            trace.append({"tool": "guest_profile", "args": {"guest_id": p["guest_id"]},
+                          "result": {"name": profile["name"], "allergies": sorted(profile_allergens)}})
+        order_allergens |= profile_allergens
         large = int(p.get("party_size") or 0) >= LARGE_PARTY or bool(p.get("large"))
         has_starter = any(i.get("course") == "starter" for i in p["items"])
         out_items, held, rejected = [], [], []
@@ -73,7 +77,7 @@ class OrderAgent(LiveAgent):
             if p["channel"] == "online" or large or course in ("starter", "dessert") or not has_starter:
                 fire = now
             else:
-                fire = now + COURSE_GAP_MIN * 60
+                fire = now + settings.COURSE_GAP_MIN * 60
             mod_text = []
             if res.get("leave_out"):
                 mod_text.append("ALLERGY " + "/".join(res["conflict"]) + ": no " + ", ".join(cat.INGREDIENTS_BY_ID[i].name for i in res["leave_out"]))
@@ -86,14 +90,16 @@ class OrderAgent(LiveAgent):
             if svc.menu.sold(dish):
                 svc.on_limit_reached(dish)
             out_items.append({"item_id": item_id, "dish_id": dish, "name": d.name, "station": route["station"], "course": course,
+                              "seat": it.get("seat"),
                               "fire_at": svc.clock.iso(fire), "mods": mod_text, "allergy_resolved": bool(res.get("leave_out"))})
         latency_ms = round((time.perf_counter() - t0) * 1000, 3)
         svc.metrics.order_latency_ms.append(latency_ms)
         order = {"order_id": order_id, "channel": p["channel"], "table_ids": p.get("table_ids", []), "party_id": p.get("party_id"),
                  "items": out_items, "held": held, "rejected": rejected, "allergens": sorted(order_allergens),
-                 "latency_ms": latency_ms, "course_gap_min": COURSE_GAP_MIN if has_starter and not large else 0,
+                 "latency_ms": latency_ms, "course_gap_min": settings.COURSE_GAP_MIN if has_starter and not large else 0,
                  "stations": sorted({i["station"] for i in out_items}), "kind": p.get("kind", "food"),
-                 "customer": p.get("customer", ""), "source": p.get("source", "sim")}
+                 "customer": p.get("customer", ""), "source": p.get("source", "sim"), "guest_id": p.get("guest_id"),
+                 "profile_allergens": sorted(profile_allergens), "fulfilment": p.get("fulfilment"), "zone": p.get("zone")}
         svc.orders[order_id] = order
         svc.bus.publish(E.ORDER_CREATED, order, source=self.name)
         for h in held:
@@ -179,7 +185,7 @@ class OrderAgent(LiveAgent):
             self.slammed_for = 0
             self.calm_for = 0
         mode = svc.online.mode
-        if self.slammed_for >= SLAMMED_STREAK_MIN and mode == "open":
+        if self.slammed_for >= settings.SLAMMED_STREAK_MIN and mode == "open":
             trace = [{"tool": "station_queue", "args": {}, "result": [
                 {k: r[k] for k in ("station", "queue_depth", "wait_min", "utilisation")} for r in load["stations"]]}]
             others_calm = all(r["wait_min"] < 6 for r in load["stations"] if r["station"] in ("cold", "pastry"))
@@ -190,11 +196,11 @@ class OrderAgent(LiveAgent):
                 f"{'Limit online orders to quick items' if new == 'quick_only' else 'Pause online orders'}: {why}",
                 f"kitchen slammed for {self.slammed_for} min (score {load['score']}); {why}", trace,
                 key="throttle_online", confidence=0.8, timeout_default="reject")])
-        elif self.calm_for >= CALM_STREAK_MIN and mode != "open":
+        elif self.calm_for >= settings.CALM_STREAK_MIN and mode != "open":
             self.calm_for = 0
             self.submit([self.proposal("throttle_online", {"mode": "open", "reason": "kitchen calm again"},
                                        "Reopen online orders: kitchen calm again",
-                                       f"busyness calm for {CALM_STREAK_MIN} min", [], key="reopen_online", confidence=0.9)])
+                                       f"busyness calm for {settings.CALM_STREAK_MIN} min", [], key="reopen_online", confidence=0.9)])
 
     # ------------------------------------------------------------------ late online orders -> comp
     def on_quote(self, ev: E.Event) -> None:
@@ -202,7 +208,7 @@ class OrderAgent(LiveAgent):
         if o.get("status") in ("ready", "picked_up") or o["order_id"] in self.comped:
             return
         late = float(o.get("late_by_min") or 0)
-        if late < COMP_LATE_MIN:
+        if late < settings.COMP_LATE_MIN:
             return
         self.comped.add(o["order_id"])
         amt = round(o.get("total", 0) * COMP_SHARE, 2)

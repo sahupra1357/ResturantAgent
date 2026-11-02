@@ -1,6 +1,6 @@
 export const AGENT_LABEL = {
   order: 'Order', inventory: 'Inventory', forecasting: 'Forecasting', procurement: 'Procurement', menu: 'Menu',
-  coordinator: 'Coordinator', scenario: 'Scenario', manager: 'Manager',
+  prep: 'Prep & staff', coordinator: 'Coordinator', scenario: 'Scenario', manager: 'Manager', host: 'Host', safety: 'Safety', service: 'Service',
 }
 
 export const STATE_LABEL = {
@@ -37,7 +37,6 @@ export function describe(ev, state) {
     case 'forecast.miss': return `Forecast miss ${p.miss_pct > 0 ? '+' : ''}${p.miss_pct}%: ${p.reason}`
     case 'weather.alert': return `Weather alert: ${p.alert} ${p.temp_c} °C`
     case 'online.mode': return `Online ordering → ${p.mode.replace('_', ' ')} (${p.reason})`
-    case 'quote.updated': return `${p.order_id}: ${p.notifications?.[p.notifications.length - 1]?.text || 'quote updated'}`
     case 'decision.proposed': return `${AGENT_LABEL[p.agent] || p.agent} proposes: ${p.title}${p.status === 'pending' ? ' (needs approval)' : ''}`
     case 'decision.resolved': return `#${p.id} ${p.status}: ${p.title}${p.note && p.status !== 'executed' ? ` (${p.note})` : ''}`
     case 'agent.log': return `${AGENT_LABEL[p.agent] || p.agent}: ${p.message}`
@@ -45,6 +44,10 @@ export function describe(ev, state) {
     case 'item.held': return `Held ${d(p.dish_id)}: allergy ${p.conflict?.join('/')}`
     case 'service.ended': return 'Service ended'
     case 'order.rejected': return `Order rejected: ${p.reason}`
+    case 'supplier.learned': return `Supplier ${p.supplier_id} fill rate ${Math.round(p.fill_rate_before * 100)}% → ${Math.round(p.fill_rate * 100)}% (${p.reason})`
+    case 'temp.alert': return `Temperature alert: ${p.message}`
+    case 'staff.updated': return `${STATION_LABEL[p.station] || p.station}: ${p.cooks} cooks (${p.change}, ${p.reason})`
+    case 'quote.updated': return `${p.order_id}: ${p.notifications?.[p.notifications.length - 1]?.text || 'quote updated'}`
     default: return ev.type
   }
 }

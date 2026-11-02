@@ -36,6 +36,14 @@ ONLINE_MODE = "online.mode"
 TABLE_UPDATED = "table.updated"
 PARTY_ARRIVED = "party.arrived"
 PARTY_LEFT = "party.left"
+# front of house / payments / safety / staffing
+HOST_UPDATED = "host.updated"          # bookings + waitlist snapshot
+CHECK_UPDATED = "check.updated"
+TEMP_ALERT = "temp.alert"
+SAFETY_UPDATED = "safety.updated"
+PREP_UPDATED = "prep.updated"          # mise-en-place burn-down + staffing snapshot
+STAFF_UPDATED = "staff.updated"
+SUPPLIER_LEARNED = "supplier.learned"
 # decisions
 DECISION_PROPOSED = "decision.proposed"
 DECISION_RESOLVED = "decision.resolved"

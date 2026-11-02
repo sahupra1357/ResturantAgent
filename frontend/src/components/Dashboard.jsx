@@ -2,15 +2,11 @@ import { useEffect, useState } from 'react'
 import { api } from '../api.js'
 import { AGENT_LABEL, STATION_LABEL, describe, hhmm, money, num } from '../format.js'
 import { useNow } from '../store.js'
+import { ChecksPanel, GuestsPanel, HostPanel } from './FrontOfHouse.jsx'
+import { MenuEngineeringPanel, ReportPanel, SuppliersPanel } from './Insights.jsx'
+import { PrepPanel, SafetyPanel, WastePanel } from './KitchenOps.jsx'
+import { Panel } from './ui.jsx'
 
-function Panel({ title, right, children, className = '' }) {
-  return (
-    <section className={`panel ${className}`}>
-      <header><h3>{title}</h3>{right}</header>
-      <div className="panel-body">{children}</div>
-    </section>
-  )
-}
 
 const STATUS_CLASS = { pending: 'warn', executed: 'ok', approved: 'ok', rejected: 'bad', blocked: 'bad', timeout: 'muted', failed: 'bad', auto: 'ok' }
 
@@ -76,8 +72,10 @@ function ApprovalCard({ d, state }) {
   const [edit, setEdit] = useState(false)
   const [payload, setPayload] = useState(JSON.stringify(d.payload, null, 1))
   const [err, setErr] = useState('')
-  const running = (state.clock?.speed || 0) > 0
-  const left = Math.max(0, (d.remaining_s ?? d.timeout_s) - (running ? (now - (d.receivedAt || now)) / 1000 : 0))
+  const speed = state.clock?.speed || 0
+  // the timeout runs in service minutes (frozen while paused); estimate between server updates
+  const leftMin = Math.max(0, (d.remaining_min ?? d.timeout_min) - (speed ? ((now - (d.receivedAt || now)) / 1000) * speed / 60 : 0))
+  const leftWall = speed ? Math.ceil((leftMin * 60) / speed) : null
   const act = async (approved) => {
     setErr('')
     try {
@@ -93,7 +91,7 @@ function ApprovalCard({ d, state }) {
       <div className="ap-head">
         <span className={`agent a-${d.agent}`}>{AGENT_LABEL[d.agent]}</span>
         <span className="ap-timer" title={`then: ${d.timeout_default === 'approve' ? 'approve' : 'no action'}`}>
-          {Math.ceil(left)}s → {d.timeout_default === 'approve' ? 'auto-approve' : 'no action'}
+          {Math.ceil(leftMin)} service min{leftWall != null ? ` (~${leftWall}s)` : ' (paused)'} → {d.timeout_default === 'approve' ? 'auto-approve' : 'no action'}
         </span>
       </div>
       <p className="ap-title">{d.title}</p>
@@ -154,19 +152,19 @@ export function KitchenPanel({ state }) {
 
 export function OnlineOrdersPanel({ state }) {
   const [ov, setOv] = useState({})
-  const orders = Object.values(state.online?.orders || {}).filter((o) => o.status !== 'picked_up').sort((a, b) => (a.order_id < b.order_id ? 1 : -1))
-  const done = Object.values(state.online?.orders || {}).filter((o) => o.status === 'picked_up').length
+  const orders = Object.values(state.online?.orders || {}).filter((o) => o.status !== 'picked_up' && o.status !== 'delivered').sort((a, b) => (a.order_id < b.order_id ? 1 : -1))
+  const done = Object.values(state.online?.orders || {}).filter((o) => o.status === 'picked_up' || o.status === 'delivered').length
   return (
-    <Panel title="Online orders" right={<span className="muted small">{orders.length} active · {done} picked up</span>}>
+    <Panel title="Online orders" right={<span className="muted small">{orders.length} active · {done} done</span>}>
       {orders.length === 0 && <p className="muted">No active online orders.</p>}
       <table className="grid">
         <thead><tr><th>Order</th><th>Items</th><th>Quoted</th><th>Now</th><th></th></tr></thead>
         <tbody>{orders.slice(0, 14).map((o) => (
           <tr key={o.order_id} className={o.late ? 'late' : ''}>
             <td><b>{o.order_id}</b><br /><small className="muted">{o.customer}</small></td>
-            <td className="small">{o.items.map((i) => i.name).join(', ')}</td>
+            <td className="small">{o.items.map((i) => i.name).join(', ')}<br /><span className="muted">{o.fulfilment === 'delivery' ? `delivery · zone ${o.zone}${o.driver_id ? ` · ${o.driver_id}` : ''}` : 'pickup'}</span></td>
             <td>{o.quoted_hhmm.join('–')}</td>
-            <td>{o.status === 'cooking' ? o.current_hhmm.join('–') : o.status}{o.late && <span className="pill bad">late {o.late_by_min}m</span>}{o.override && <span className="pill">override</span>}</td>
+            <td>{o.status === 'cooking' ? o.current_hhmm.join('–') : o.status === 'out_for_delivery' ? `on the way, ${o.eta_hhmm}` : o.status.replaceAll('_', ' ')}{o.late && <span className="pill bad">late {o.late_by_min}m</span>}{o.override && <span className="pill">override</span>}</td>
             <td className="actions">
               {o.status === 'cooking' && <>
                 <input size={5} placeholder="HH:MM" value={ov[o.order_id] || ''} onChange={(e) => setOv({ ...ov, [o.order_id]: e.target.value })} aria-label="Override ready time" />
@@ -262,6 +260,8 @@ export function KpiPanel({ state }) {
     ['86 count', `${k.eighty_six ?? 0} (${k.eighty_six_caught ?? 0} caught)`], ['Stockouts', k.stockouts],
     ['Waste', money(k.waste_value)], ['Food cost', k.food_cost_pct != null ? `${k.food_cost_pct}%` : '–'],
     ['Auto / approval', `${k.decisions_auto ?? 0} / ${k.decisions_approval ?? 0}`], ['Comps', money(k.comps)],
+    ['Collected', money(k.pay_collected)], ['Tips', money(k.pay_tips)], ['Delivery on time', k.delivery_accuracy_pct != null ? `${k.delivery_accuracy_pct}%` : '–'],
+    ['Waitlist', k.waitlist ?? 0], ['No-shows', k.no_shows ?? 0], ['Surge labour', money(k.surge_labor)],
   ]
   return (
     <Panel title="Service KPIs" className="span2">
@@ -303,18 +303,52 @@ export function BaselinePanel() {
   )
 }
 
+const TABS = [
+  ['ops', 'Operations'], ['foh', 'Front of house'], ['kitchen', 'Kitchen & safety'], ['insights', 'Insights'],
+]
+
 export default function Dashboard({ state }) {
+  const [tab, setTab] = useState(() => { try { return localStorage.getItem('ro-tab') || 'ops' } catch { return 'ops' } })
+  const pick = (t) => { setTab(t); try { localStorage.setItem('ro-tab', t) } catch { /* private mode */ } }
+  const pending = Object.values(state.decisions || {}).filter((d) => d.status === 'pending').length
   return (
-    <div className="dash">
-      <ApprovalQueue state={state} />
-      <KitchenPanel state={state} />
-      <DecisionFeed state={state} />
-      <OnlineOrdersPanel state={state} />
-      <InventoryPanel state={state} />
-      <ForecastPanel state={state} />
-      <KpiPanel state={state} />
-      <ActivityPanel state={state} />
-      <BaselinePanel />
-    </div>
+    <>
+      <div className="tabs dash-tabs" role="tablist" aria-label="Dashboard sections">
+        {TABS.map(([k, label]) => (
+          <button key={k} role="tab" aria-selected={tab === k} className={tab === k ? 'on' : ''} onClick={() => pick(k)}>
+            {label}{k === 'ops' && pending > 0 ? <span className="count hot">{pending}</span> : null}
+          </button>
+        ))}
+      </div>
+      <div className="dash" role="tabpanel">
+        {tab === 'ops' && <>
+          <ApprovalQueue state={state} />
+          <KitchenPanel state={state} />
+          <DecisionFeed state={state} />
+          <OnlineOrdersPanel state={state} />
+          <InventoryPanel state={state} />
+          <KpiPanel state={state} />
+          <ActivityPanel state={state} />
+        </>}
+        {tab === 'foh' && <>
+          <HostPanel state={state} />
+          <ChecksPanel state={state} />
+          <GuestsPanel />
+        </>}
+        {tab === 'kitchen' && <>
+          <PrepPanel state={state} />
+          <SafetyPanel state={state} />
+          <InventoryPanel state={state} />
+          <WastePanel state={state} />
+        </>}
+        {tab === 'insights' && <>
+          <ForecastPanel state={state} />
+          <ReportPanel state={state} />
+          <MenuEngineeringPanel state={state} />
+          <SuppliersPanel state={state} />
+          <BaselinePanel />
+        </>}
+      </div>
+    </>
   )
 }

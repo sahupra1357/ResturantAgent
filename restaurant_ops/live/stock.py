@@ -32,6 +32,9 @@ class LiveStock:
         self.food_cost = 0.0
         self.reload()
 
+    def __getstate__(self):
+        return {k: v for k, v in self.__dict__.items() if k != "conn"}
+
     def reload(self, ingredient_ids: list[str] | None = None) -> None:
         ds = self.date.isoformat()
         q = ("SELECT lot_id, ingredient_id, qty, expiry_date, received_date, unit_cost FROM lots WHERE status='active' "
