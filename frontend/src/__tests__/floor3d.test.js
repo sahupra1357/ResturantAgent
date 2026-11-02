@@ -1,11 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import { chairSpots, colorForParty, personTargets, stepToward, toWorld, WAIT_ORIGIN } from '../floor3d.js'
+import { chairSpots, colorForParty, personTargets, stepToward, toWorld, WAIT_COLS, WAIT_ORIGIN, waitSpots } from '../floor3d.js'
 
 const T = (id, seats, shape, extra = {}) => ({ id, seats, shape, x: 100, y: 100, w: shape === 'rect' ? 120 : 62, h: shape === 'rect' ? 84 : 62, state: 'available', ...extra })
 
 describe('3D floor scene math', () => {
   it('maps the plan centre to the world origin', () => {
-    expect(toWorld(500, 310)).toEqual({ x: 0, z: 0 })
+    expect(toWorld(500, 350)).toEqual({ x: 0, z: 0 })
   })
 
   it('places one chair per seat', () => {
@@ -30,6 +30,25 @@ describe('3D floor scene math', () => {
     const waiting = byParty('P9')
     expect(waiting).toHaveLength(3)
     expect(waiting.every((x) => x.pose === 'stand' && x.z >= WAIT_ORIGIN.z)).toBe(true)
+  })
+
+  it('queues waiting parties inside the lobby without splitting a party across rows', () => {
+    // lobby on the plan: x 640-985, y 488-620
+    const lobby = { x0: toWorld(640, 0).x, x1: toWorld(985, 0).x, z0: toWorld(0, 488).z, z1: toWorld(0, 620).z }
+    const wl = Array.from({ length: 8 }, (_, i) => ({ party_id: `W${i}`, size: 2 + (i % 4), checking_in: i === 0 }))
+    const p = personTargets({}, wl)
+    const pts = Object.values(p)
+    expect(pts).toHaveLength(wl.reduce((a, w) => a + w.size, 0))
+    for (const q of pts) {
+      expect(q.x).toBeGreaterThanOrEqual(lobby.x0)
+      expect(q.x).toBeLessThanOrEqual(lobby.x1)
+      expect(q.z).toBeGreaterThanOrEqual(lobby.z0)
+      expect(q.z).toBeLessThanOrEqual(lobby.z1)
+    }
+    for (const w of wl) expect(new Set(pts.filter((q) => q.partyId === w.party_id).map((q) => q.z)).size).toBe(1)
+    expect(pts.filter((q) => q.checkingIn)).toHaveLength(2)
+    expect(Object.keys(waitSpots([{ party_id: 'X', size: 40 }]))).toEqual(['X'])
+    expect(waitSpots([{ party_id: 'X', size: 40 }]).X.n).toBe(WAIT_COLS)
   })
 
   it('gives each party a stable colour', () => {

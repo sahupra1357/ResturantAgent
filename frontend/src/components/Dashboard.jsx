@@ -5,6 +5,7 @@ import { useNow } from '../store.js'
 import { ChecksPanel, GuestsPanel, HostPanel } from './FrontOfHouse.jsx'
 import { MenuEngineeringPanel, ReportPanel, SuppliersPanel } from './Insights.jsx'
 import { PrepPanel, SafetyPanel, WastePanel } from './KitchenOps.jsx'
+import { AuditSection, BackupsPanel, DayClosePanel, GiftCardPanel, LlmPanel, PoOutboxPanel } from './BackOffice.jsx'
 import { Panel } from './ui.jsx'
 
 
@@ -304,10 +305,10 @@ export function BaselinePanel() {
 }
 
 const TABS = [
-  ['ops', 'Operations'], ['foh', 'Front of house'], ['kitchen', 'Kitchen & safety'], ['insights', 'Insights'],
+  ['ops', 'Operations'], ['foh', 'Front of house'], ['kitchen', 'Kitchen & safety'], ['insights', 'Insights'], ['office', 'Back office'],
 ]
 
-export default function Dashboard({ state }) {
+export default function Dashboard({ state, me }) {
   const [tab, setTab] = useState(() => { try { return localStorage.getItem('ro-tab') || 'ops' } catch { return 'ops' } })
   const pick = (t) => { setTab(t); try { localStorage.setItem('ro-tab', t) } catch { /* private mode */ } }
   const pending = Object.values(state.decisions || {}).filter((d) => d.status === 'pending').length
@@ -347,7 +348,16 @@ export default function Dashboard({ state }) {
           <MenuEngineeringPanel state={state} />
           <SuppliersPanel state={state} />
           <BaselinePanel />
+          <LlmPanel state={state} />
         </>}
+        {tab === 'office' && (['manager', 'admin'].includes(me?.role) ? <>
+          <DayClosePanel state={state} />
+          <GiftCardPanel />
+          <PoOutboxPanel state={state} />
+          <BackupsPanel me={me} />
+          <LlmPanel state={state} />
+          <AuditSection />
+        </> : <p className="muted">The back office needs a manager or admin account.</p>)}
       </div>
     </>
   )

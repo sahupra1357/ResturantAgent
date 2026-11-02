@@ -337,12 +337,14 @@ def load_catalog(conn: sqlite3.Connection) -> dict[str, int]:
     """Write the static catalog into the database (idempotent); returns row counts."""
     cur = conn.cursor()
     cur.executemany(
-        "INSERT OR REPLACE INTO ingredients VALUES (?,?,?,?,?,?,?,?,?)",
+        "INSERT OR REPLACE INTO ingredients (id, name, unit, category, storage, shelf_life_days, allergens, ref_cost, seasonal_months) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
         [(i.id, i.name, i.unit, i.category, i.storage, i.shelf_life_days, _csv(i.allergens),
           i.ref_cost, _csv(i.seasonal_months)) for i in INGREDIENTS],
     )
     cur.executemany(
-        "INSERT OR REPLACE INTO dishes VALUES (?,?,?,?,?,?,?,?,?)",
+        "INSERT OR REPLACE INTO dishes (id, name, category, price, station, is_cold, seasonal_months, prep_minutes, active) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
         [(d.id, d.name, d.category, d.price, d.station, int(d.is_cold), _csv(d.seasonal_months),
           d.prep_minutes, 1) for d in DISHES],
     )
@@ -351,7 +353,8 @@ def load_catalog(conn: sqlite3.Connection) -> dict[str, int]:
         [(d.id, ing, q) for d in DISHES for ing, q in d.recipe.items()],
     )
     cur.executemany(
-        "INSERT OR REPLACE INTO suppliers VALUES (?,?,?,?,?,?,?)",
+        "INSERT OR REPLACE INTO suppliers (id, name, lead_time_days, min_order_value, fill_rate, delay_prob, order_cutoff_hour) "
+        "VALUES (?,?,?,?,?,?,?)",
         [(s.id, s.name, s.lead_time_days, s.min_order_value, s.fill_rate, s.delay_prob,
           s.order_cutoff_hour) for s in SUPPLIERS],
     )
@@ -365,3 +368,65 @@ def load_catalog(conn: sqlite3.Connection) -> dict[str, int]:
         "recipe_lines": sum(len(d.recipe) for d in DISHES),
         "suppliers": len(SUPPLIERS), "supplier_items": len(SUPPLIER_ITEMS),
     }
+
+
+# --------------------------------------------------------------------------- runtime catalog from the database
+
+PARALLEL_DEFAULT = 3
+COOK_FACTOR_DEFAULT = 2.4
+
+
+def reload_from_db(conn: sqlite3.Connection) -> dict[str, int]:
+    """Replace the module-level catalog with the database's (admin edits): ingredients, active dishes and recipes,
+    suppliers and their items, stations and default staffing. Lists and dicts are updated in place, so every module
+    that imported them sees the new catalog. Popularity / tags are synthetic-data hints and keep their old values."""
+    def split(v, conv=str):
+        return tuple(conv(x) for x in (v or "").split(",") if x)
+
+    ings = [Ingredient(r["id"], r["name"], r["unit"], r["category"], r["storage"], int(r["shelf_life_days"]),
+                       split(r["allergens"]), float(r["ref_cost"]), split(r["seasonal_months"], int))
+            for r in conn.execute("SELECT * FROM ingredients ORDER BY rowid")]
+    if not ings:
+        return {"ingredients": 0}
+    recipes: dict[str, dict[str, float]] = {}
+    for d, i, q in conn.execute("SELECT dish_id, ingredient_id, qty_per_portion FROM recipe_lines"):
+        recipes.setdefault(d, {})[i] = float(q)
+    old = dict(DISHES_BY_ID)
+    dishes = []
+    for r in conn.execute("SELECT * FROM dishes WHERE active=1 ORDER BY rowid"):
+        prev = old.get(r["id"])
+        dishes.append(Dish(r["id"], r["name"], r["category"], float(r["price"]), r["station"], bool(r["is_cold"]),
+                           float(r["prep_minutes"]), recipes.get(r["id"], {}), split(r["seasonal_months"], int),
+                           popularity=prev.popularity if prev else 5.0, tags=prev.tags if prev else ()))
+    sups = [Supplier(r["id"], r["name"], int(r["lead_time_days"]), float(r["min_order_value"]), float(r["fill_rate"]),
+                     float(r["delay_prob"]), int(r["order_cutoff_hour"])) for r in conn.execute("SELECT * FROM suppliers")]
+    items = [SupplierItem(r["supplier_id"], r["ingredient_id"], float(r["price"]), float(r["pack_size"]))
+             for r in conn.execute("SELECT * FROM supplier_items")]
+    INGREDIENTS[:] = ings
+    INGREDIENTS_BY_ID.clear()
+    INGREDIENTS_BY_ID.update({i.id: i for i in ings})
+    DISHES[:] = dishes
+    DISHES_BY_ID.clear()
+    DISHES_BY_ID.update({d.id: d for d in dishes})
+    SUPPLIERS[:] = sups
+    SUPPLIERS_BY_ID.clear()
+    SUPPLIERS_BY_ID.update({s.id: s for s in sups})
+    SUPPLIER_ITEMS[:] = items
+    try:
+        st = [dict(r) for r in conn.execute("SELECT * FROM stations WHERE active=1 ORDER BY rowid")]
+    except sqlite3.Error:
+        st = []
+    if st:
+        STATIONS[:] = [r["id"] for r in st]
+        DEFAULT_STAFFING.clear()
+        DEFAULT_STAFFING.update({r["id"]: {"lunch": int(r["lunch_cooks"]), "dinner": int(r["dinner_cooks"]),
+                                           "late": int(r["late_cooks"])} for r in st})
+        STATION_CAPACITY.clear()
+        STATION_CAPACITY.update({s: {p: station_capacity_minutes(s, p) for p in MEAL_PERIOD_MINUTES} for s in STATIONS})
+        STATION_META.clear()
+        STATION_META.update({r["id"]: {"name": r["name"], "parallel": int(r["parallel"]), "cook_factor": float(r["cook_factor"])}
+                             for r in st})
+    return {"ingredients": len(ings), "dishes": len(dishes), "suppliers": len(sups), "stations": len(STATIONS)}
+
+
+STATION_META: dict[str, dict] = {}

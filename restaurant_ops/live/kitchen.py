@@ -37,9 +37,18 @@ QUICK_MAX_MIN = 8.0         # 'quick items' for the online throttle mode
 BUSY_LEVELS = ((0.55, "calm"), (0.9, "busy"), (math.inf, "slammed"))
 
 
+def station_factor(station: str) -> float:
+    """Cook minutes per labour minute: admin setting (stations table) if present, else the built-in default."""
+    return float(cat.STATION_META.get(station, {}).get("cook_factor", COOK_FACTOR.get(station, cat.COOK_FACTOR_DEFAULT)))
+
+
+def station_parallel(station: str) -> int:
+    return int(cat.STATION_META.get(station, {}).get("parallel", PARALLEL.get(station, cat.PARALLEL_DEFAULT)))
+
+
 def cook_minutes(dish_id: str) -> float:
     d = cat.DISHES_BY_ID[dish_id]
-    return round(d.prep_minutes * COOK_FACTOR[d.station] + PLATING_MIN, 2)
+    return round(d.prep_minutes * station_factor(d.station) + PLATING_MIN, 2)
 
 
 @dataclass
@@ -77,7 +86,7 @@ class Kitchen:
     def __init__(self, staff: dict[str, int], seed: int = 42):
         self.stations: dict[str, Station] = {}
         for s in cat.STATIONS:
-            st = Station(s, int(staff.get(s, 1)), PARALLEL[s])
+            st = Station(s, int(staff.get(s, 1)), station_parallel(s))
             st.slots_free_at = [0.0] * st.slots
             self.stations[s] = st
         self.rng = np.random.default_rng([seed, 7])

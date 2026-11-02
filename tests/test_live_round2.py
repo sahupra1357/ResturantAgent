@@ -13,6 +13,7 @@ import time
 import pytest
 
 from restaurant_ops.config import settings
+from tests.conftest import ANON, bearer, token  # noqa: F401
 from restaurant_ops.live import events as E
 from restaurant_ops.live.replay import load_events
 from restaurant_ops.live.run import POLICIES, parse_schedule
@@ -135,12 +136,13 @@ def test_scorecard_blends_history():
 # =========================================================================== 3. auth & roles
 
 
-def _client():
+def _client(user: str | None = "manager"):
+    """A TestClient that sends `user`'s session token by default (None: anonymous)."""
     from fastapi.testclient import TestClient
 
     from restaurant_ops.live import server
 
-    return TestClient(server.app)
+    return TestClient(server.app, headers=bearer(user) if user else {})
 
 
 def H(tok):
@@ -148,24 +150,27 @@ def H(tok):
 
 
 def test_roles_guard_mutations():
-    with _client() as c:
-        assert c.get("/api/state").status_code == 200                       # reads are open
-        assert c.post("/api/clock", json={"speed": 0}).status_code == 401    # no token
+    with _client(None) as c:
+        assert c.get("/api/state").status_code == 401                       # reads need a signed-in user
+        assert c.get("/api/public/state").status_code == 200                # ... except the public online view
+        assert c.post("/api/clock", json={"speed": 0}).status_code == 401    # no session
         assert c.post("/api/clock", json={"speed": 0}, headers=H("wrong")).status_code == 401
-        assert c.post("/api/clock", json={"speed": 0}, headers=H(settings.SERVER_TOKEN)).status_code == 403
-        assert c.post("/api/clock", json={"speed": 0}, headers=H(settings.MANAGER_TOKEN)).status_code == 200
-        assert c.post("/api/scenarios/heatwave", headers=H(settings.KITCHEN_TOKEN)).status_code == 403
-        assert c.post("/api/decisions/1", json={"approved": True}, headers=H(settings.SERVER_TOKEN)).status_code == 403
-        assert c.post("/api/online/mode", json={"mode": "paused"}, headers=H(settings.SERVER_TOKEN)).status_code == 403
-        st = c.get("/api/state").json()
+        srv, mgr, kit = bearer("server"), bearer("manager"), bearer("kitchen")
+        assert c.post("/api/clock", json={"speed": 0}, headers=srv).status_code == 403
+        assert c.post("/api/clock", json={"speed": 0}, headers=mgr).status_code == 200
+        assert c.post("/api/scenarios/heatwave", headers=kit).status_code == 403
+        assert c.post("/api/decisions/1", json={"approved": True}, headers=srv).status_code == 403
+        assert c.post("/api/online/mode", json={"mode": "paused"}, headers=srv).status_code == 403
+        assert c.get("/api/admin/config", headers=mgr).status_code == 403   # setup is admin-only
+        st = c.get("/api/state", headers=srv).json()
         free = next(t for t, v in st["tables"].items() if v["state"] == "available" and v["seats"] >= 2)
         body = {"table_id": free, "items": [{"dish_id": "caesar_salad"}], "party_size": 2}
-        assert c.post("/api/orders", json=body, headers=H(settings.KITCHEN_TOKEN)).status_code == 403
-        assert c.post("/api/orders", json=body, headers=H(settings.SERVER_TOKEN)).status_code == 200
-        assert c.get("/api/whoami", headers=H(settings.KITCHEN_TOKEN)).json()["role"] == "kitchen"
-        assert c.get(f"/api/report.html?token={settings.MANAGER_TOKEN}").status_code == 200
-        assert c.get("/api/report.html").status_code == 401
-        # the public online page needs no token
+        assert c.post("/api/orders", json=body, headers=kit).status_code == 403
+        assert c.post("/api/orders", json=body, headers=srv).status_code == 200
+        assert c.get("/api/auth/me", headers=kit).json()["role"] == "kitchen"
+        assert c.get(f"/api/report.html?token={token('manager')}").status_code == 401   # no tokens in URLs
+        assert c.get("/api/report.html", headers=mgr).status_code == 200
+        # the public online page needs no session
         assert c.post("/api/online/quote", json={"dish_ids": ["caesar_salad"]}).status_code == 200
 
 
@@ -173,7 +178,7 @@ def test_auth_can_be_disabled(monkeypatch):
     monkeypatch.setattr(settings, "AUTH_ENABLED", False)
     with _client() as c:
         assert c.post("/api/clock", json={"speed": 0}).status_code == 200
-        assert c.get("/api/whoami").json()["role"] == "manager"
+        assert c.get("/api/auth/me", headers=ANON).json()["role"] == "admin"   # auth off: local admin
 
 
 # =========================================================================== 4. persistence / resume
@@ -290,8 +295,24 @@ def test_checks_paid_with_tips_and_splits(full_night):
     for c in paid:
         t = svc.payments.totals(c)
         assert t["balance"] == 0 and t["paid"] == pytest.approx(t["due"], abs=0.02)
-    assert any(c.splits for c in paid), "some tables split the bill"
+    for c in paid:  # a simulated split (20% of parties of 4+) pays every share
+        assert all(sp["paid"] for sp in c.splits)
     assert svc.conn.execute("SELECT COUNT(*) FROM payments WHERE kind='payment'").fetchone()[0] >= len(paid)
+
+
+def test_simulated_party_splits_the_bill_evenly():
+    svc = make()
+    try:
+        svc.start()
+        st = svc.snapshot()
+        free = next(t for t, v in st["tables"].items() if v["state"] == "available" and v["seats"] >= 4)
+        svc.manual_order(free, [{"dish_id": "ribeye_steak"}, {"dish_id": "caesar_salad"}], party_size=4)
+        c = svc.payments.open_for_party(svc.floor.parties[svc.floor.tables[free].party_id])
+        svc.payments.settle_sim(c, tip_pct=0.18, split_ways=2)
+        assert len(c.splits) == 2 and all(sp["paid"] for sp in c.splits) and svc.payments.totals(c)["balance"] == 0
+        assert len([p for p in c.payments if p["amount"] > 0]) == 2
+    finally:
+        svc.close()
 
 
 def test_discount_refund_guards():
@@ -543,22 +564,22 @@ def test_redis_dies_mid_service():
 
 
 class _FakeStructured:
-    def __init__(self, judgment, fail=False):
-        self.j, self.fail = judgment, fail
+    def __init__(self, judgment, fail=False, include_raw=False):
+        self.j, self.fail, self.raw = judgment, fail, include_raw
 
     def invoke(self, messages):
         if self.fail:
             raise RuntimeError("model unavailable")
         assert "Candidate actions" in messages[0].content
-        return self.j
+        return {"parsed": self.j, "raw": None, "parsing_error": None} if self.raw else self.j
 
 
 class _FakeLLM:
     def __init__(self, judgment=None, fail=False):
         self.j, self.fail = judgment, fail
 
-    def with_structured_output(self, schema):
-        return _FakeStructured(self.j, self.fail)
+    def with_structured_output(self, schema, include_raw=False, **kw):
+        return _FakeStructured(self.j, self.fail, include_raw)
 
 
 @pytest.mark.parametrize("fail", [False, True])
@@ -591,8 +612,8 @@ def test_llm_review_path_with_stub(monkeypatch, fail):
 
 
 def test_api_contract():
-    mgr = H(settings.MANAGER_TOKEN)
-    srv = H(settings.SERVER_TOKEN)
+    mgr = bearer('manager')
+    srv = bearer('server')
     with _client() as c:
         st = c.get("/api/state").json()
         for key in ("service", "clock", "tables", "kitchen", "inventory", "forecast", "menu", "online", "decisions", "kpis",
@@ -647,7 +668,7 @@ def test_websocket_fan_out_many_clients():
 
 
 def test_websocket_clients_receive_snapshot_and_batches():
-    mgr = H(settings.MANAGER_TOKEN)
+    mgr = bearer('manager')
     with _client() as c:
         socks = [c.websocket_connect("/ws") for _ in range(10)]
         conns = [s.__enter__() for s in socks]

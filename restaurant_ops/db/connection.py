@@ -24,9 +24,12 @@ def get_conn(db_path: str | Path | None = None) -> sqlite3.Connection:
 
 
 def init_db(conn: sqlite3.Connection) -> None:
-    """Create all tables and indexes (idempotent)."""
+    """Create all tables and indexes, then apply pending column migrations (idempotent)."""
     conn.executescript(SCHEMA_PATH.read_text())
     conn.commit()
+    from restaurant_ops.db.migrations import migrate
+
+    migrate(conn)
 
 
 def query_df(sql: str, params: Sequence = (), conn: sqlite3.Connection | None = None) -> pd.DataFrame:

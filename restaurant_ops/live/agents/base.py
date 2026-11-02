@@ -14,12 +14,12 @@ from typing import TYPE_CHECKING
 from pydantic import BaseModel, Field
 
 from restaurant_ops.agents import llm
+from restaurant_ops.config import settings
 from restaurant_ops.live import events as E
 
 if TYPE_CHECKING:  # pragma: no cover
     from restaurant_ops.live.service import Service
 
-LLM_TIMEOUT_S = 12.0
 
 
 class Judgment(BaseModel):
@@ -70,20 +70,33 @@ class LiveAgent:
         if not proposals:
             return []
         if self.llm_reviewed and not llm.is_mock():
-            fut = self.svc.executor.submit(_review, self.name, situation or {}, proposals)
-            self.svc.pending_llm.append({"future": fut, "deadline": time.monotonic() + LLM_TIMEOUT_S,
-                                         "agent": self, "proposals": proposals})
-            return []
+            ok, why = self.svc.llm_guard.allow()
+            if ok:
+                fut = self.svc.executor.submit(_review, self.name, situation or {}, proposals)
+                self.svc.pending_llm.append({"future": fut, "deadline": time.monotonic() + settings.LLM_TIMEOUT_S,
+                                             "agent": self, "proposals": proposals, "t0": time.perf_counter()})
+                return []
+            self.svc.llm_guard.refused += 1
+            for p in proposals:
+                p["mode"] = "rule"
+                p["reason"] = f"{p['reason']} (LLM review skipped: {why})"
         return [self.svc.coordinator.submit(p) for p in proposals]
 
-    def finish_review(self, proposals: list[dict], fut: Future | None) -> list[dict]:
-        """Called by the service loop when the LLM review is done (or timed out)."""
+    def finish_review(self, proposals: list[dict], fut: Future | None, t0: float | None = None) -> list[dict]:
+        """Called by the service loop when the LLM review is done (or timed out). Every outcome is recorded by the guard."""
         j = None
+        guard = self.svc.llm_guard
         if fut is not None and fut.done():
             try:
-                j = fut.result()
+                res = fut.result()
+                j = res["judgment"]
+                guard.record(self.name, True, res["latency_ms"], res["tokens_in"], res["tokens_out"])
             except Exception as e:  # noqa: BLE001
+                guard.record(self.name, False, None if t0 is None else (time.perf_counter() - t0) * 1000, error=f"{type(e).__name__}: {e}")
                 self.log(f"LLM review failed ({type(e).__name__}); using rule-based proposals")
+        else:
+            guard.record(self.name, False, settings.LLM_TIMEOUT_S * 1000, error="timeout")
+            self.log(f"LLM review timed out after {settings.LLM_TIMEOUT_S:.0f}s; using rule-based proposals")
         if j is None:
             for p in proposals:
                 p["mode"] = "rule"
@@ -108,13 +121,29 @@ class LiveAgent:
         """Called once per sim minute."""
 
 
-def _review(agent: str, situation: dict, proposals: list[dict]) -> Judgment:
+def review_prompt(agent: str, situation: dict, proposals: list[dict]) -> str:
     import json
-
-    from langchain_core.messages import HumanMessage
 
     cands = [{"i": i, "action_type": p["action_type"], "title": p["title"], "payload": p["payload"], "reason": p["reason"]}
              for i, p in enumerate(proposals)]
-    msg = JUDGE_PROMPT.format(agent=agent, situation=json.dumps(situation, default=str)[:3000],
-                              candidates=json.dumps(cands, default=str)[:3000])
-    return llm.get_llm().with_structured_output(Judgment).invoke([HumanMessage(content=msg)])
+    return JUDGE_PROMPT.format(agent=agent, situation=json.dumps(situation, default=str)[:3000],
+                               candidates=json.dumps(cands, default=str)[:3000])
+
+
+def _review(agent: str, situation: dict, proposals: list[dict]) -> dict:
+    """One model call (worker thread). Returns the judgment plus latency and token usage for the guard."""
+    from langchain_core.messages import HumanMessage
+
+    t0 = time.perf_counter()
+    out = llm.get_llm().with_structured_output(Judgment, include_raw=True).invoke(
+        [HumanMessage(content=review_prompt(agent, situation, proposals))])
+    raw = None
+    if isinstance(out, dict):
+        raw, parsed = out.get("raw"), out.get("parsed")
+        if parsed is None:
+            raise ValueError(f"unparseable model output: {out.get('parsing_error')}")
+    else:
+        parsed = out
+    usage = getattr(raw, "usage_metadata", None) or {}
+    return {"judgment": parsed, "latency_ms": round((time.perf_counter() - t0) * 1000, 1),
+            "tokens_in": int(usage.get("input_tokens", 0) or 0), "tokens_out": int(usage.get("output_tokens", 0) or 0)}

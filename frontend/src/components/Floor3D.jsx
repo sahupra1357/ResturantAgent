@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import * as THREE from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 import { STATE_LABEL } from '../format.js'
-import { DOOR, STATE_COLORS, chairSpots, colorForParty, personTargets, stepToward, tableCenter, toWorld } from '../floor3d.js'
+import { DOOR, ROOM, STATE_COLORS, chairSpots, colorForParty, personTargets, stepToward, tableCenter, toWorld, waitSpots } from '../floor3d.js'
 import OrderDialog from './OrderDialog.jsx'
 
 const WALK_SPEED = 3.2 // world units per second
@@ -55,6 +55,7 @@ export default function Floor3D({ state, onFallback }) {
   const tables = state.tables || {}
   const waitlist = state.host?.waitlist || []
   const targets = useMemo(() => personTargets(tables, waitlist), [tables, waitlist])
+  const spots = useMemo(() => waitSpots(waitlist), [waitlist])
 
   // build the scene once
   useEffect(() => {
@@ -74,9 +75,9 @@ export default function Floor3D({ state, onFallback }) {
     const scene = new THREE.Scene()
     scene.background = new THREE.Color(dark ? '#16181b' : '#efece7')
     const camera = new THREE.PerspectiveCamera(40, 1.6, 0.1, 200)
-    camera.position.set(0.8, 19.5, 17.5)
+    camera.position.set(0.6, 17.5, 15.5)
     const controls = new OrbitControls(camera, renderer.domElement)
-    controls.target.set(0.8, 0, 0.9)
+    controls.target.set(0.6, 0, 1.2)
     controls.maxPolarAngle = Math.PI / 2.15
     controls.minDistance = 6
     controls.maxDistance = 32
@@ -87,28 +88,43 @@ export default function Floor3D({ state, onFallback }) {
     scene.add(sun)
 
     // room
-    const floor = new THREE.Mesh(new THREE.PlaneGeometry(26, 16.5), new THREE.MeshStandardMaterial({ color: dark ? '#2a2622' : '#d9c7ad', roughness: 0.95 }))
+    const floor = new THREE.Mesh(new THREE.PlaneGeometry(ROOM.w, ROOM.d), new THREE.MeshStandardMaterial({ color: dark ? '#2a2622' : '#d9c7ad', roughness: 0.95 }))
     floor.rotation.x = -Math.PI / 2
     scene.add(floor)
     const wallMat = new THREE.MeshStandardMaterial({ color: dark ? '#3a3d42' : '#f7f4ef', roughness: 0.9 })
-    for (const [w, d, x, z] of [[26, 0.2, 0, -8.25], [0.2, 16.5, -13, 0], [0.2, 16.5, 13, 0], [26, 0.2, 0, 8.25]]) {
+    const hw = ROOM.w / 2
+    const hd = ROOM.d / 2
+    const doorHalf = 0.9
+    // the right wall has a gap for the entrance
+    for (const [w, d, x, z] of [[ROOM.w, 0.2, 0, -hd], [0.2, ROOM.d, -hw, 0], [ROOM.w, 0.2, 0, hd],
+      [0.2, DOOR.z - doorHalf + hd, hw, (-hd + DOOR.z - doorHalf) / 2], [0.2, hd - DOOR.z - doorHalf, hw, (hd + DOOR.z + doorHalf) / 2]]) {
       const wall = new THREE.Mesh(new THREE.BoxGeometry(w, 0.9, d), wallMat)
       wall.position.set(x, 0.45, z)
       scene.add(wall)
     }
-    const door = new THREE.Mesh(new THREE.BoxGeometry(0.25, 0.92, 1.6), new THREE.MeshStandardMaterial({ color: '#7c4a2d' }))
-    door.position.set(13, 0.46, DOOR.z)
+    const door = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.05, doorHalf * 2), new THREE.MeshStandardMaterial({ color: '#7c4a2d' }))
+    door.position.set(hw, 0.03, DOOR.z)
     scene.add(door)
-    // fixtures from the plan
+    // fixtures from the plan: solid counters, a floor marking for the waiting area, the entrance
     const fx = state.layout?.fixtures || {}
     const fixMat = new THREE.MeshStandardMaterial({ color: dark ? '#55504a' : '#8b6f55', roughness: 0.6 })
     for (const [k, f] of Object.entries(fx)) {
       const c = toWorld(f.x + f.w / 2, f.y + f.h / 2)
-      const m = new THREE.Mesh(new THREE.BoxGeometry(f.w / 40, k === 'bar_counter' ? 1.05 : 0.9, f.h / 40), fixMat)
-      m.position.set(c.x, k === 'bar_counter' ? 0.52 : 0.45, c.z)
-      scene.add(m)
+      const kind = f.kind || 'solid'
+      if (kind === 'zone') {
+        const rug = new THREE.Mesh(new THREE.PlaneGeometry(f.w / 40, f.h / 40),
+          new THREE.MeshStandardMaterial({ color: dark ? '#3b4a5c' : '#b9cde0', roughness: 1, transparent: true, opacity: 0.8 }))
+        rug.rotation.x = -Math.PI / 2
+        rug.position.set(c.x, 0.01, c.z)
+        scene.add(rug)
+      } else if (kind === 'solid') {
+        const tall = k === 'bar_counter' ? 1.05 : 0.9
+        const m = new THREE.Mesh(new THREE.BoxGeometry(f.w / 40, tall, f.h / 40), fixMat)
+        m.position.set(c.x, tall / 2, c.z)
+        scene.add(m)
+      }
       const lab = labelSprite(f.label)
-      lab.position.set(c.x, 1.5, c.z)
+      lab.position.set(kind === 'door' ? c.x - 0.6 : c.x, kind === 'zone' ? 0.5 : 1.5, kind === 'zone' ? c.z + f.h / 80 - 0.25 : c.z)
       lab.scale.set(1.0, 0.38, 1)
       scene.add(lab)
     }
@@ -173,7 +189,7 @@ export default function Floor3D({ state, onFallback }) {
 
     const resize = () => {
       const w = el.clientWidth || 600
-      const h = Math.round(Math.min(w * 0.6, 620))
+      const h = Math.round(Math.max(360, Math.min(w * 0.7, (window.innerHeight || 900) * 0.7)))
       renderer.setSize(w, h)
       camera.aspect = w / h
       camera.updateProjectionMatrix()
@@ -206,7 +222,7 @@ export default function Floor3D({ state, onFallback }) {
       raf = requestAnimationFrame(tick)
     }
     raf = requestAnimationFrame(tick)
-    ctx.current = { scene, people, tableObjs, geo }
+    ctx.current = { scene, people, tableObjs, geo, partyLabels: {} }
     return () => {
       cancelAnimationFrame(raf)
       ro.disconnect()
@@ -265,6 +281,29 @@ export default function Floor3D({ state, onFallback }) {
     }
   }, [targets])
 
+  // a name tag over each waiting party (with "checking in" while the host greets them)
+  useEffect(() => {
+    const c = ctx.current
+    if (!c) return
+    for (const [pid, sp] of Object.entries(spots)) {
+      const w = sp.party
+      const sub = w.checking_in ? (w.reason || 'checking in').replace('waiting for the rest of the party', 'party not all here') : `${w.size} · ${w.waited_min ?? 0}m${w.quoted_min != null ? ` / ${w.quoted_min}m` : ''}`
+      const key = `${w.name}|${sub}`
+      const old = c.partyLabels[pid]
+      const pos = { x: sp.x - ((sp.n - 1) * 0.55) / 2, z: sp.z }
+      if (old && old.key === key) { old.lab.position.set(pos.x, 1.45, pos.z); continue }
+      if (old) { c.scene.remove(old.lab); old.lab.material.map.dispose() }
+      const lab = labelSprite(String(w.name || pid).slice(0, 14), sub)
+      lab.scale.set(1.1, 0.41, 1)
+      lab.position.set(pos.x, 1.45, pos.z)
+      c.scene.add(lab)
+      c.partyLabels[pid] = { lab, key }
+    }
+    for (const [pid, o] of Object.entries(c.partyLabels)) {
+      if (!spots[pid]) { c.scene.remove(o.lab); o.lab.material.map.dispose(); delete c.partyLabels[pid] }
+    }
+  }, [spots])
+
   const seatedGuests = Object.values(targets).filter((t) => t.pose === 'sit').length
   const waiting = Object.values(targets).filter((t) => t.pose === 'stand').length
   const selTable = sel ? tables[sel] : null
@@ -275,7 +314,7 @@ export default function Floor3D({ state, onFallback }) {
         {Object.entries(STATE_COLORS).map(([s, col]) => (
           <span key={s} className="lg"><i style={{ background: col }} />{STATE_LABEL[s]}</span>
         ))}
-        <span className="lg-occ">{seatedGuests} seated · {waiting} waiting · drag to rotate, scroll to zoom, click a table</span>
+        <span className="lg-occ">{seatedGuests} seated · {waiting} waiting in {waitlist.length} parties · drag to rotate, scroll to zoom, click a table</span>
       </div>
       {selTable && <OrderDialog state={state} table={selTable} onClose={() => setSel(null)} />}
     </div>

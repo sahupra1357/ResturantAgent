@@ -1,13 +1,18 @@
 // Pure scene math for the 3D dining floor (no three.js here, so it is unit-tested with vitest).
-// Plan coordinates (the 2D floor's 1000 x 620 viewBox) map to world units: 40 px = 1 m-ish unit.
+// Plan coordinates (the 2D floor's 1000 x 700 viewBox) map to world units: 40 px = 1 m-ish unit.
 
 export const SCALE = 40
-export const DOOR = { x: 12.6, z: 3.3 }           // entrance by the host stand
-export const WAIT_ORIGIN = { x: 7.6, z: 6.6 }     // waiting area in front of the host stand
-export const WAIT_COLS = 9
+export const PLAN = { w: 1000, h: 700 }
+export const ROOM = { w: 24.5, d: 17 }            // the walled room (plan 10..990 x 10..690)
+export const DOOR = { x: 12.4, z: 5.1 }           // the entrance (plan x 985, y 520-590)
+// the waiting area (plan x 640-985, y 488-620): guests queue from the door leftwards, row after row
+export const WAIT_ORIGIN = { x: 11.5, z: 4.45 }
+export const WAIT_COLS = 15
+export const WAIT_STEP = 0.55
+export const WAIT_ROW = 0.62
 
 export function toWorld(px, py) {
-  return { x: (px - 500) / SCALE, z: (py - 310) / SCALE }
+  return { x: (px - PLAN.w / 2) / SCALE, z: (py - PLAN.h / 2) / SCALE }
 }
 
 export function tableCenter(t) {
@@ -46,7 +51,8 @@ export function chairSpots(t) {
 }
 
 // Where every guest should be: seated at a chair of their party's table(s), or standing in the waiting area.
-// tables: {id: tableView}; waitlist: [{party_id, size}]. Returns {personId: {x, z, pose, partyId, tableId}}.
+// tables: {id: tableView}; waitlist: [{party_id, size, checking_in}]. Returns {personId: {x, z, pose, partyId, tableId}}.
+// A party never splits across two rows of the waiting area.
 export function personTargets(tables, waitlist = []) {
   const byParty = {}
   for (const t of Object.values(tables || {})) {
@@ -64,15 +70,27 @@ export function personTargets(tables, waitlist = []) {
       out[`${pid}-${i}`] = { x: chairs[i].x, z: chairs[i].z, rot: chairs[i].rot, pose: 'sit', partyId: pid, tableId: chairs[i].tableId }
     }
   }
-  let k = 0
-  for (const w of waitlist || []) {
-    for (let i = 0; i < (w.size || 0); i++) {
-      const col = k % WAIT_COLS
-      const row = Math.floor(k / WAIT_COLS)
-      out[`${w.party_id}-${i}`] = { x: WAIT_ORIGIN.x - col * 0.55, z: WAIT_ORIGIN.z + row * 0.55, rot: Math.PI, pose: 'stand', partyId: w.party_id, tableId: null }
-      k++
+  for (const [pid, spot] of Object.entries(waitSpots(waitlist))) {
+    const w = spot.party
+    for (let i = 0; i < spot.n; i++) {
+      out[`${pid}-${i}`] = { x: spot.x - i * WAIT_STEP, z: spot.z, rot: -Math.PI / 2, pose: 'stand', partyId: pid, tableId: null,
+        checkingIn: !!w.checking_in }
     }
-    k += 1 // a gap between waiting parties
+  }
+  return out
+}
+
+// Where each waiting party stands: {partyId: {x, z, n, party}} with x the first guest (nearest the door).
+export function waitSpots(waitlist = []) {
+  const out = {}
+  let col = 0
+  let row = 0
+  for (const w of waitlist || []) {
+    const n = Math.min(w.size || 0, WAIT_COLS)
+    if (!n) continue
+    if (col + n > WAIT_COLS) { col = 0; row += 1 }
+    out[w.party_id] = { x: WAIT_ORIGIN.x - col * WAIT_STEP, z: WAIT_ORIGIN.z + (row % 4) * WAIT_ROW, n, party: w }
+    col += n + 1 // a gap between waiting parties
   }
   return out
 }

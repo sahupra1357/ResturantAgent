@@ -36,17 +36,20 @@ def _norm_allergies(v) -> str:
     return ",".join(sorted(out))
 
 
-def tier_for(points: int) -> str:
+def tier_for(points: int, tiers: dict | None = None) -> str:
     t = "Member"
-    for name, need in sorted(settings.LOYALTY_TIERS.items(), key=lambda kv: kv[1]):
+    for name, need in sorted((tiers or settings.LOYALTY_TIERS).items(), key=lambda kv: kv[1]):
         if points >= need:
             t = name
     return t
 
 
 class CRM:
-    def __init__(self, conn: sqlite3.Connection):
+    def __init__(self, conn: sqlite3.Connection, loyalty: dict | None = None):
+        """loyalty = the restaurant profile's {points_per_dollar, tiers, redeem_value_per_point} (admin-editable)."""
         self.conn = conn
+        self.loyalty = loyalty or {"points_per_dollar": settings.LOYALTY_POINTS_PER_DOLLAR, "tiers": settings.LOYALTY_TIERS,
+                                   "redeem_value_per_point": 0.01}
 
     def __getstate__(self):
         return {}
@@ -99,11 +102,18 @@ class CRM:
         g = self.get(guest_id)
         if g is None:
             raise KeyError(f"unknown guest {guest_id}")
-        pts = int(g["points"] + round(spend * settings.LOYALTY_POINTS_PER_DOLLAR))
+        pts = int(g["points"] + round(spend * float(self.loyalty["points_per_dollar"])))
         self.conn.execute("UPDATE guests SET visits=visits+1, total_spend=total_spend+?, points=?, tier=?, last_visit=? WHERE guest_id=?",
-                          (round(spend, 2), pts, tier_for(pts), date, int(guest_id)))
+                          (round(spend, 2), pts, tier_for(pts, self.loyalty["tiers"]), date, int(guest_id)))
         self.conn.execute("INSERT INTO guest_visits (guest_id, service_id, date, party_size, spend, dishes) VALUES (?,?,?,?,?,?)",
                           (int(guest_id), service_id, date, party_size, round(spend, 2), ",".join(dishes or [])))
+        return self.get(guest_id)
+
+    def spend_points(self, guest_id: int, points: int) -> dict:
+        g = self.get(guest_id)
+        if g is None or g["points"] < points:
+            raise ValueError("not enough points")
+        self.conn.execute("UPDATE guests SET points=points-? WHERE guest_id=?", (int(points), int(guest_id)))
         return self.get(guest_id)
 
     def visits(self, guest_id: int, limit: int = 20) -> list[dict]:

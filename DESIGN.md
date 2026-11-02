@@ -401,9 +401,7 @@ results. A headless run (`run_headless`) uses the same code without sleeping.
   and the optimizer read those columns, so unreliable suppliers carry a higher risk premium.
 
 ### Auth and roles (`live/server.py`)
-Bearer tokens (`MANAGER_TOKEN`, `SERVER_TOKEN`, `KITCHEN_TOKEN`; `?token=` for links). Manager: everything;
-server: orders, bookings, waitlist, tables, checks, guests; kitchen: HACCP checklist, temperatures, tickets.
-Reads, the public online page and the WebSocket are open. `AUTH_ENABLED=false` disables the check for local demos.
+Replaced in round 3 by named users (see "Round 3" below). The role tokens and `?token=` links are gone.
 
 ### Persistence (`live/persistence.py`)
 Coordinator checkpoints: LangGraph `SqliteSaver` in `{service_id}.ckpt.sqlite`. Service state (world, agents'
@@ -463,3 +461,103 @@ Dashboard tabs: Operations, Front of house (bookings, waitlist, table ops, check
 (prep & staffing, HACCP, inventory, waste) and Insights (forecast, report, menu engineering, suppliers, baseline).
 Approval alerts (title badge, chime, desktop notification), role sign-in, an end-of-service report (printable HTML
 and CSV), vitest unit tests (`npm test`).
+
+
+## Round 3: setup, money edges, identity, operations, LLM pilot
+
+### Configuration lives in the master DB (`admin.py`, `db/migrations.py`)
+New tables in `data/restaurant.db`:
+- `config_kv` (profile), `tax_rules`, `opening_hours`, `floor_tables`, `stations`, `delivery_zones`, `staff`, `roster`
+- identity: `users`, `sessions`, `audit_log`
+- money and outputs: `gift_cards`, `gift_card_ledger`, `idempotency`, `day_close`, `po_outbox`, `kds_bumps`
+- `llm_calls`, `schema_version`
+
+`migrations.migrate` adds columns to older databases (`dishes.tax_category`, `suppliers.email`,
+`payments.processor_ref`). `admin.seed_defaults` fills empty tables from the built-in world, and is idempotent.
+
+Each service copies the master at start, then runs `apply_config`. `catalog.reload_from_db` rebuilds the module-level
+catalog in place: active dishes and recipes, suppliers, stations with cook counts, items per cook and cook factor.
+`forecasting.refresh_catalog` appends new dishes so model indices stay stable, and `DISH_VIEW` is rebuilt. Edits
+therefore apply from the next service. A running dinner never changes under the kitchen, which keeps state
+consistent without a migration story for live objects. Writes validate first, for example a price above the
+recipe's food cost, a valid station, and no deleting a station that active dishes still use.
+
+### Money
+- **Taxes:** `Payments.tax_lines` applies each active rule to the check pro rata by line category (food, alcohol,
+  delivery fee) and channel. One line per rule appears on the check and in the day close.
+- **Discounts:** the cap per role comes from the profile (`discount_max_pct`) and is passed to the constraint
+  checker.
+- **Tenders:** `_take_money` routes each method:
+  - card, wallet and online go to the processor adapter (`live/processor.py`: simulated, or Stripe PaymentIntents
+    over httpx with idempotency keys)
+  - gift cards are redeemed in the master DB with a ledger row
+  - points are spent through the CRM
+  - cash needs no external call
+
+  Refunds go back the way the money came. Gift cards and users live in the master DB because they outlive a service.
+
+### Supplier channel, printer, KDS
+- **POs:** an approved PO (`_h_po`) is rendered by `po_channel.text_pdf`, a minimal PDF 1.4 writer with no
+  dependency, plus an RFC 5322 e-mail. It is sent over SMTP when configured, otherwise left in the outbox as queued.
+  A failed send keeps status `failed` with the error so it can be resent.
+- **Printer:** `outputs.KitchenPrinter` subscribes to `order.created` and prints one chit per station, to a file or
+  as ESC/POS over TCP. A printer failure becomes an `agent.log` entry and never blocks the order.
+- **KDS:** tickets come from the kitchen items, grouped by order and station. Bumps are rows in `kds_bumps`.
+
+### Identity
+`live/auth.py` handles sign-in:
+- **Passwords:** PBKDF2-SHA256 with 240k iterations.
+- **Sessions:** only `sha256(token)` is stored.
+- **Lockout:** `LOGIN_MAX_FAILURES` failures within `LOGIN_LOCK_MIN` minutes, per username.
+- **Sign-out:** a password change, deactivation or role change deletes the user's sessions.
+- **Last admin:** the last admin can't be demoted or deactivated. Every update validates before it writes.
+
+The server takes a cookie (`ro_session`, HttpOnly, SameSite=Strict, Secure with `COOKIE_SECURE`) or a Bearer header.
+Cookie writes need `X-Requested-With: ro-ui`, which a cross-site form can't set. Dependencies `need(roles)` set
+`request.state.user`, and an HTTP middleware audits every `/api` write (refused ones too), masking password and
+token fields.
+
+Reads and `/ws` need a user. Two channels stay public:
+- the online-order REST endpoints
+- `/ws/public`, which passes only menu, portions, kitchen busyness, online mode, clock and order progress, with
+  customer, guest and check ids stripped (`public_event`)
+
+### Operations
+- **Idempotency:** `idempotent()` stores the response per `Idempotency-Key` and endpoint in the master DB. The UI's
+  offline queue (`frontend/src/offline.js`) retries table orders with the same key, in order, stopping at the first
+  failure it can retry. A 4xx drops the item and reports it.
+- **Snapshots:** version 2, with a SHA-256 sidecar and rotation (`SNAPSHOT_KEEP`). `migrate` upgrades v1 blobs.
+  `load` falls back to older snapshots, and the server then falls back to `Service.recover_from_log`, which
+  continues on the service DB (stock, menu, bookings, payments) and rebuilds decisions from `decision.*` events.
+  Pending approvals stay pending.
+- **Backups:** `ops.backup` copies the master and service DBs (SQLite online backup) with a manifest. `drill`
+  restores into a temp directory, runs `integrity_check` and table checks, and unpickles the newest snapshot.
+- **Day close:** `dayclose.reconcile` and `journal` produce balanced debits and credits (cent rounding goes to
+  6900), written as CSV and JSON and stored in `day_close`.
+- **Meal periods:** `Service(period, service_date)` reads opening hours, and a closed period raises.
+- **Tool registry:** the global registry is re-bound to the calling service on every tool call
+  (`ToolBox.bind`), so two services in one process can't read each other's database.
+
+### LLM pilot (`live/llm_guard.py`, `live/llm_eval.py`)
+`LLMGuard.allow()` gates every review on mock mode, the breaker, the call cap and the cost cap. `record()` logs
+latency, tokens and cost to `llm_calls` and trips the breaker after N failures in a row. A refused or failed review
+submits the rule-based proposals with the reason. `llm_eval build` turns logged manager decisions on reviewed
+proposals into a JSONL eval set, and `run` scores a judge on it:
+- agreement
+- rejections caught
+- false drops
+- p50 / p95 latency
+- cost
+
+The mock judge (keep everything) is the baseline to beat.
+
+### Floor and lobby
+The plan is 1000 x 700, with a waiting area by the entrance. Parties wait there:
+- every arriving party, for 2–5 minutes while checking in
+- an early reservation, until about 2 minutes before its booked time (at most 15 minutes)
+- 30% of walk-in groups of 3 or more, until the rest of the party arrives (3–10 minutes)
+- anyone with no free table, as before
+
+`waitlist_view` gives the reason. The 3D view queues parties in rows in the lobby with a name tag, and the 2D view
+draws them in the dashed waiting area.
+

@@ -2,6 +2,7 @@
 // The server sends {type:'snapshot'} on connect, then {type:'batch', events:[...]}. Every event is folded by
 // applyEvent; restaurant_ops/live/replay.py `fold` is the Python twin used by the tests.
 import { useEffect, useReducer, useRef, useState } from 'react'
+import { flushQueue } from './api.js'
 
 export const FEED_SKIP = new Set([
   'clock.tick', 'kitchen.load', 'inventory.snapshot', 'kpi.updated', 'table.updated', 'quote.updated',
@@ -72,6 +73,8 @@ export function reducer(state, msg) {
       return { ...state, error: msg.payload.message }
     case 'connection':
       return { ...state, connected: msg.connected }
+    case 'auth':
+      return { ...state, connected: false, authRequired: msg.required }
     case 'replay.start':
       return { ...initialState, connected: true, replay: { ...msg.payload, done: false } }
     case 'replay.end':
@@ -86,31 +89,43 @@ function wsUrl(path) {
   return `${proto}://${window.location.host}${path}`
 }
 
-// mode: {kind:'live'} or {kind:'replay', serviceId, speed}
-export function useLiveStore() {
+// mode: {kind:'live'} (staff, needs a session), {kind:'public'} (the online-order page) or {kind:'replay', serviceId, speed}.
+// `enabled` false keeps the socket closed (e.g. before sign-in). The socket reconnects with backoff; a 4401 close means
+// the session is gone. On every (re)connect of the staff socket, orders captured offline are flushed.
+export function useLiveStore(initialMode = { kind: 'live' }, enabled = true) {
   const [state, dispatch] = useReducer(reducer, initialState)
-  const [mode, setMode] = useState({ kind: 'live' })
+  const [mode, setMode] = useState(initialMode)
   const wsRef = useRef(null)
 
   useEffect(() => {
+    if (!enabled) return undefined
     let closed = false
     let retry = null
+    let backoff = 1000
     const connect = () => {
-      const path = mode.kind === 'live' ? '/ws' : `/ws/replay/${mode.serviceId}?speed=${mode.speed || 60}`
+      const path = mode.kind === 'live' ? '/ws' : mode.kind === 'public' ? '/ws/public' : `/ws/replay/${mode.serviceId}?speed=${mode.speed || 60}`
       const ws = new WebSocket(wsUrl(path))
       wsRef.current = ws
-      ws.onopen = () => dispatch({ type: 'connection', connected: true })
+      ws.onopen = () => {
+        backoff = 1000
+        dispatch({ type: 'connection', connected: true })
+        if (mode.kind === 'live') flushQueue().catch(() => {})
+      }
       ws.onmessage = (m) => {
         try { dispatch(JSON.parse(m.data)) } catch (e) { console.error(e) }
       }
-      ws.onclose = () => {
+      ws.onclose = (e) => {
+        if (e.code === 4401) { dispatch({ type: 'auth', required: true }); return }
         dispatch({ type: 'connection', connected: false })
-        if (!closed && mode.kind === 'live') retry = setTimeout(connect, 1500)
+        if (!closed && mode.kind !== 'replay') {
+          retry = setTimeout(connect, backoff)
+          backoff = Math.min(backoff * 2, 15000)
+        }
       }
     }
     connect()
     return () => { closed = true; clearTimeout(retry); wsRef.current && wsRef.current.close() }
-  }, [mode])
+  }, [mode, enabled])
 
   return { state, mode, setMode }
 }

@@ -132,7 +132,9 @@ export function ChecksPanel({ state }) {
             {c.lines.map((l, i) => <tr key={i}><td>{l.name}{l.seat ? <small className="muted"> seat {l.seat}</small> : null}</td><td>{money(l.price)}</td></tr>)}
             <tr><td>Subtotal</td><td>{money(c.subtotal)}</td></tr>
             {c.discounts > 0 && <tr><td>Discounts / comps</td><td>-{money(c.discounts)}</td></tr>}
-            <tr><td>Tax</td><td>{money(c.tax)}</td></tr>
+            {(c.tax_lines || []).length > 0
+              ? c.tax_lines.map((t) => <tr key={t.name}><td className="small">{t.name}</td><td>{money(t.amount)}</td></tr>)
+              : <tr><td>Tax</td><td>{money(c.tax)}</td></tr>}
             <tr><td><b>Due</b></td><td><b>{money(c.due)}</b></td></tr>
             <tr><td>Paid (+ tips {money(c.tips)})</td><td>{money(c.paid)}</td></tr>
             {c.refunded > 0 && <tr><td>Refunded</td><td>{money(c.refunded)}</td></tr>}
@@ -148,8 +150,10 @@ export function ChecksPanel({ state }) {
               <div className="form-row">
                 <input aria-label="Payment amount" placeholder={`amount (${c.balance})`} value={pay.amount} onChange={(e) => setPay({ ...pay, amount: e.target.value })} />
                 <input aria-label="Tip" placeholder="tip" value={pay.tip} onChange={(e) => setPay({ ...pay, tip: e.target.value })} />
-                <select aria-label="Method" value={pay.method} onChange={(e) => setPay({ ...pay, method: e.target.value })}>{['card', 'cash', 'wallet'].map((m) => <option key={m}>{m}</option>)}</select>
-                <button className="primary" onClick={() => act(() => api.pay(c.check_id, { amount: Number(pay.amount || c.balance), tip: Number(pay.tip || 0), method: pay.method }), 'Paid')}>Pay</button>
+                <select aria-label="Method" value={pay.method} onChange={(e) => setPay({ ...pay, method: e.target.value })}>{[['card', 'card'], ['cash', 'cash'], ['wallet', 'wallet'], ['gift_card', 'gift card'], ['points', 'loyalty points']].map(([m, l]) => <option key={m} value={m}>{l}</option>)}</select>
+                {pay.method === 'gift_card' && <input aria-label="Gift card code" placeholder="gift card code" value={pay.gift_code || ''} onChange={(e) => setPay({ ...pay, gift_code: e.target.value.toUpperCase() })} />}
+                <button className="primary" onClick={() => act(() => api.pay(c.check_id, { amount: Number(pay.amount || c.balance), tip: Number(pay.tip || 0), method: pay.method,
+                  gift_code: pay.method === 'gift_card' ? pay.gift_code : null }), 'Paid')}>Pay</button>
               </div>
               <div className="form-row">
                 <input aria-label="Discount percent" type="number" min="1" max="100" value={disc.pct} onChange={(e) => setDisc({ ...disc, pct: e.target.value })} />

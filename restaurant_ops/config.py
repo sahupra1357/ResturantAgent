@@ -104,11 +104,47 @@ class Settings(BaseSettings):
     TEMP_LIMITS: dict[str, list[float]] = {"walk_in": [0.0, 5.0], "freezer": [-30.0, -15.0], "hot_holding": [63.0, 90.0]}
     DONATION_MIN_VALUE: float = 10.0
 
-    # --- auth (roles: manager > server, kitchen) ---
+    # --- identity (named users; roles admin > manager > server, kitchen) ---
     AUTH_ENABLED: bool = True
-    MANAGER_TOKEN: str = "manager-dev-token"   # change these outside a demo
-    SERVER_TOKEN: str = "server-dev-token"
-    KITCHEN_TOKEN: str = "kitchen-dev-token"
+    SESSION_HOURS: float = 12.0
+    ADMIN_USERNAME: str = "admin"
+    ADMIN_PASSWORD: str = ""          # first-run admin; empty = a random password written to data/FIRST_RUN_ADMIN.txt
+    DEMO_USERS: bool = True           # also create manager/server/kitchen demo users (password "<role>-demo"); false in production
+    COOKIE_SECURE: bool = False       # set true behind HTTPS
+    LOGIN_MAX_FAILURES: int = 5       # per username per LOGIN_LOCK_MIN minutes
+    LOGIN_LOCK_MIN: float = 5.0
+
+    # --- money & ordering edges ---
+    PAYMENT_PROCESSOR: str = "simulated"   # simulated | stripe
+    STRIPE_SECRET_KEY: str = ""
+    PAYMENT_TIMEOUT_S: float = 15.0
+    CURRENCY: str = "usd"
+    OUTBOX_DIR: Path = PROJECT_ROOT / "data" / "outbox"   # PO PDFs / e-mails when SMTP is not configured
+    SMTP_HOST: str = ""
+    SMTP_PORT: int = 587
+    SMTP_USER: str = ""
+    SMTP_PASSWORD: str = ""
+    SMTP_FROM: str = "orders@bistro80.example"
+    SMTP_STARTTLS: bool = True
+    PRINTER_MODE: str = "file"        # file | tcp | off   (kitchen chits, one printer per station)
+    PRINTER_DIR: Path = PROJECT_ROOT / "data" / "printer"
+    PRINTER_HOST: str = ""            # tcp: an ESC/POS printer (port 9100); per-station override PRINTER_HOST_<STATION>
+    PRINTER_PORT: int = 9100
+    KDS_LATE_MIN: float = 20.0        # a KDS ticket older than this turns red
+
+    # --- operations ---
+    BACKUP_DIR: Path = PROJECT_ROOT / "data" / "backups"
+    BACKUP_KEEP: int = 14
+    EXPORT_DIR: Path = PROJECT_ROOT / "data" / "exports"
+    SNAPSHOT_KEEP: int = 3            # rotated service snapshots
+
+    # --- LLM pilot guard ---
+    LLM_TIMEOUT_S: float = 12.0
+    LLM_MAX_CALLS_PER_SERVICE: int = 150
+    LLM_MAX_COST_PER_SERVICE: float = 2.0      # USD
+    LLM_PRICE_IN_PER_MTOK: float = 3.0         # USD per million input tokens (set for your model)
+    LLM_PRICE_OUT_PER_MTOK: float = 15.0
+    LLM_BREAKER_FAILURES: int = 3              # consecutive failures/timeouts -> rule-based for the rest of the service
 
     # --- operations ---
     LOG_JSON: bool = False

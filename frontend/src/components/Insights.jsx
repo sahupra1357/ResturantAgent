@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { api, withToken } from '../api.js'
+import { api } from '../api.js'
 import { money } from '../format.js'
 import { Panel } from './ui.jsx'
 
@@ -55,11 +55,11 @@ export function ReportPanel({ state }) {
     <Panel title="End-of-service report" right={ended ? <span className="pill ok">service ended</span> : <span className="muted small">live so far</span>}>
       <p className="small">KPIs, payments, sales by dish, every decision and the waste summary. Open the printable page (Print → Save as PDF) or download a CSV.</p>
       <div className="form-row">
-        <a className="btn" href={withToken('/api/report.html')} target="_blank" rel="noreferrer">Open report</a>
-        <a className="btn" href={withToken('/api/report.csv')}>Download CSV</a>
+        <a className="btn" href="/api/report.html" target="_blank" rel="noreferrer">Open report</a>
+        <a className="btn" href="/api/report.csv">Download CSV</a>
         <a className="btn" href="/metrics" target="_blank" rel="noreferrer">Prometheus metrics</a>
       </div>
-      <p className="small muted">Report links need a manager token (sign in at the top).</p>
+      <p className="small muted">Report links need a manager or admin sign-in.</p>
     </Panel>
   )
 }

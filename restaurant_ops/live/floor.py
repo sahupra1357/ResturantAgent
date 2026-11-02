@@ -56,13 +56,17 @@ class Party:
     name: str = ""
     check_id: str | None = None
     pay_by: float | None = None   # manual parties: auto-settle at the terminal after this
+    greet_until: float | None = None  # checking in with the host before being walked to a table
+    prefer_tables: list[str] | None = None
+    wait_reason: str = ""  # why a party with a free table is still in the lobby (checking in, early, party incomplete)
 
     def to_dict(self) -> dict:
         return asdict(self)
 
 
 def build_layout() -> list[Table]:
-    """20 tables (8 two-tops, 8 four-tops, 4 six-tops = 72 seats) + 8 bar seats = 80 seats. Coordinates in a 1000x640 plan."""
+    """20 tables (8 two-tops, 8 four-tops, 4 six-tops = 72 seats) + 8 bar seats = 80 seats. Coordinates in the
+    PLAN_W x PLAN_H plan."""
     t: list[Table] = []
     n = 1
     # two-tops along the window (top row)
@@ -85,10 +89,14 @@ def build_layout() -> list[Table]:
     return t
 
 
+PLAN_W, PLAN_H = 1000, 700
+# kind 'solid' = furniture (a box in 3D); 'zone' = a marked floor area (dashed in 2D)
 LAYOUT_FIXTURES = {
-    "host_stand": {"x": 900, "y": 470, "w": 80, "h": 50, "label": "Host"},
-    "kitchen_pass": {"x": 640, "y": 560, "w": 340, "h": 50, "label": "Kitchen pass"},
-    "bar_counter": {"x": 70, "y": 525, "w": 470, "h": 26, "label": "Bar"},
+    "host_stand": {"x": 860, "y": 440, "w": 120, "h": 34, "label": "Host stand", "kind": "solid"},
+    "lobby": {"x": 640, "y": 488, "w": 345, "h": 132, "label": "Waiting area", "kind": "zone"},
+    "entrance": {"x": 985, "y": 520, "w": 12, "h": 70, "label": "Entrance", "kind": "door"},
+    "bar_counter": {"x": 70, "y": 525, "w": 470, "h": 26, "label": "Bar", "kind": "solid"},
+    "kitchen_pass": {"x": 70, "y": 636, "w": 540, "h": 44, "label": "Kitchen pass", "kind": "solid"},
 }
 # tables that can be pushed together for big parties
 COMBOS = [("T17", "T18"), ("T19", "T20"), ("T17", "T19"), ("T18", "T20"), ("T13", "T14"), ("T15", "T16"),
@@ -96,8 +104,15 @@ COMBOS = [("T17", "T18"), ("T19", "T20"), ("T17", "T19"), ("T18", "T20"), ("T13"
 
 
 class Floor:
-    def __init__(self):
-        self.tables: dict[str, Table] = {t.id: t for t in build_layout()}
+    def __init__(self, rows: list[dict] | None = None):
+        """rows = admin `floor_tables` (active ones are used); the built-in layout when there are none."""
+        active = [r for r in (rows or []) if r.get("active", 1)]
+        if active:
+            tables = [Table(r["id"], int(r["seats"]), float(r["x"]), float(r["y"]), float(r["w"]), float(r["h"]), r["shape"],
+                            r.get("section") or SERVERS[i % len(SERVERS)]) for i, r in enumerate(active)]
+        else:
+            tables = build_layout()
+        self.tables: dict[str, Table] = {t.id: t for t in tables}
         self.parties: dict[str, Party] = {}
         self.waitlist: list[str] = []
 
@@ -128,7 +143,7 @@ class Floor:
             if got:
                 return got
         for combo in COMBOS:
-            if all(self.free(c) for c in combo) and sum(self.tables[c].seats for c in combo) >= size:
+            if all(c in self.tables for c in combo) and all(self.free(c) for c in combo) and sum(self.tables[c].seats for c in combo) >= size:
                 return list(combo)
         return None
 

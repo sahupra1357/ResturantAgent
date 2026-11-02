@@ -590,9 +590,11 @@ def _check_discount(a, p, conn, as_of, out):
         amt = sub * (_num(p.get("pct"), 0) or 0) / 100
     if amt <= 0:
         out.append(Violation("positive_quantities", "discount must be > 0"))
-    elif sub and amt / sub * 100 > default_settings.DISCOUNT_MAX_PCT + 1e-9:
-        out.append(Violation("discount_too_large", f"discount {amt:.2f} is {amt / sub * 100:.0f}% of the bill "
-                                                   f"(max {default_settings.DISCOUNT_MAX_PCT:.0f}%)"))
+    else:
+        cap = _num(p.get("max_pct"), default_settings.DISCOUNT_MAX_PCT)
+        if sub and amt / sub * 100 > cap + 1e-9:
+            out.append(Violation("discount_too_large", f"discount {amt:.2f} is {amt / sub * 100:.0f}% of the bill (max {cap:.0f}% "
+                                                       f"for this role)"))
     if not str(p.get("reason", "")).strip():
         out.append(Violation("missing_reason", "a discount needs a reason"))
 

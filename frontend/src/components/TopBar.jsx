@@ -1,37 +1,62 @@
-import { useEffect, useState } from 'react'
-import { api, getToken, setToken } from '../api.js'
+import { useState } from 'react'
+import { api } from '../api.js'
 
 const SPEEDS = [[0, '⏸'], [1, '1x'], [10, '10x'], [60, '60x']]
 
-function SignIn({ role, setRole }) {
-  const [open, setOpen] = useState(false)
-  const [tok, setTok] = useState(getToken())
-  const [err, setErr] = useState('')
-  const save = async (e) => {
+function NewServiceDialog({ state, onClose, run }) {
+  const s = state.service || {}
+  const [period, setPeriod] = useState(s.period || 'dinner')
+  const [date, setDate] = useState(s.date || '')
+  const [speed, setSpeed] = useState(10)
+  const [seed, setSeed] = useState('')
+  const submit = (e) => {
     e.preventDefault()
-    setToken(tok.trim())
-    try {
-      const r = await api.whoami()
-      if (tok.trim() && !r.role) { setErr('Token not recognised'); return }
-      setRole(r.role)
-      setOpen(false)
-      setErr('')
-    } catch (x) { setErr(x.message) }
+    run(api.start({ period, date: date || null, speed: Number(speed), seed: seed === '' ? null : Number(seed) })).then((r) => r && onClose())
+  }
+  return (
+    <div className="modal-back" onClick={onClose}>
+      <form className="modal narrow" onClick={(e) => e.stopPropagation()} onSubmit={submit} aria-label="Start a new service">
+        <div className="modal-head"><h3>Start a new service</h3><button type="button" className="ghost" onClick={onClose} aria-label="Close">✕</button></div>
+        <p className="small muted">The current service is saved first. Setup changes (menu, tables, taxes, roster…) apply from this new service.</p>
+        <div className="form-grid">
+          <label>Meal period
+            <select value={period} onChange={(e) => setPeriod(e.target.value)}>
+              <option value="lunch">Lunch</option><option value="dinner">Dinner</option><option value="late">Late</option>
+            </select>
+          </label>
+          <label>Date <input type="date" value={date} onChange={(e) => setDate(e.target.value)} /></label>
+          <label>Speed <select value={speed} onChange={(e) => setSpeed(e.target.value)}>{[1, 10, 60].map((v) => <option key={v} value={v}>{v}x</option>)}</select></label>
+          <label>Seed <input type="number" placeholder="default" value={seed} onChange={(e) => setSeed(e.target.value)} /></label>
+        </div>
+        <div className="form-row"><button className="primary" type="submit">Start</button><button type="button" onClick={onClose}>Cancel</button></div>
+      </form>
+    </div>
+  )
+}
+
+function UserMenu({ me, onSignOut }) {
+  const [open, setOpen] = useState(false)
+  const [pw, setPw] = useState({ cur: '', next: '' })
+  const [msg, setMsg] = useState('')
+  const change = async (e) => {
+    e.preventDefault()
+    try { await api.changePassword(pw.cur, pw.next); setMsg('Password changed'); setPw({ cur: '', next: '' }) } catch (x) { setMsg(x.message) }
   }
   return (
     <>
-      <button onClick={() => setOpen(true)} aria-label="Sign in with a role token">{role ? `Signed in: ${role}` : 'Sign in'}</button>
+      <button onClick={() => setOpen(true)} aria-label="Account">{me.display_name || me.username} · {me.role}</button>
       {open && (
         <div className="modal-back" onClick={() => setOpen(false)}>
-          <form className="modal narrow" onClick={(e) => e.stopPropagation()} onSubmit={save}>
-            <div className="modal-head"><h3>Role token</h3><button type="button" className="ghost" onClick={() => setOpen(false)} aria-label="Close">✕</button></div>
-            <p className="small muted">Manager: approvals, scenarios, clock, discounts, refunds, reports. Server: orders, bookings, waitlist, tables, checks, guests. Kitchen: HACCP and temperatures. Demo tokens are in config (MANAGER_TOKEN, SERVER_TOKEN, KITCHEN_TOKEN).</p>
-            <input autoFocus aria-label="Token" type="password" value={tok} onChange={(e) => setTok(e.target.value)} placeholder="paste a token" />
+          <form className="modal narrow" onClick={(e) => e.stopPropagation()} onSubmit={change}>
+            <div className="modal-head"><h3>{me.display_name || me.username}</h3><button type="button" className="ghost" onClick={() => setOpen(false)} aria-label="Close">✕</button></div>
+            <p className="small muted">Signed in as <b>{me.username}</b> ({me.role}).</p>
+            <label>Current password <input type="password" autoComplete="current-password" value={pw.cur} onChange={(e) => setPw({ ...pw, cur: e.target.value })} /></label>
+            <label>New password <input type="password" autoComplete="new-password" value={pw.next} onChange={(e) => setPw({ ...pw, next: e.target.value })} /></label>
             <div className="form-row">
-              <button className="primary" type="submit">Sign in</button>
-              <button type="button" onClick={() => { setTok(''); setToken(''); setRole(null); setOpen(false) }}>Sign out</button>
+              <button type="submit" disabled={!pw.cur || pw.next.length < 8}>Change password</button>
+              <button type="button" className="danger" onClick={onSignOut}>Sign out</button>
             </div>
-            {err && <p className="err small">{err}</p>}
+            {msg && <p className="small">{msg}</p>}
           </form>
         </div>
       )}
@@ -39,15 +64,15 @@ function SignIn({ role, setRole }) {
   )
 }
 
-export default function TopBar({ state, mode, setMode, alerts }) {
+export default function TopBar({ state, mode, setMode, alerts, me, onSignOut, layout, setLayout }) {
   const [svcs, setSvcs] = useState(null)
   const [err, setErr] = useState('')
-  const [role, setRole] = useState(null)
-  useEffect(() => { api.whoami().then((r) => setRole(r.role)).catch(() => {}) }, [])
+  const [newSvc, setNewSvc] = useState(false)
+  const isMgr = me && ['manager', 'admin'].includes(me.role)
   const c = state.clock || {}
   const s = state.service || {}
   const replay = mode.kind === 'replay'
-  const run = (p) => p.catch((e) => setErr(e.message))
+  const run = (p) => p.catch((e) => { setErr(e.message); return null })
   const pending = Object.values(state.decisions || {}).filter((d) => d.status === 'pending').length
   return (
     <header className="topbar">
@@ -64,14 +89,14 @@ export default function TopBar({ state, mode, setMode, alerts }) {
         {replay ? <span className="pill warn">replay {state.replay?.done ? '(done)' : ''}</span> : (
           <div className="seg" role="group" aria-label="Clock speed">
             {SPEEDS.map(([v, l]) => (
-              <button key={v} className={c.speed === v ? 'on' : ''} onClick={() => run(api.speed(v))} aria-label={v ? `${v}x speed` : 'pause'}>{l}</button>
+              <button key={v} disabled={!isMgr} className={c.speed === v ? 'on' : ''} onClick={() => run(api.speed(v))} aria-label={v ? `${v}x speed` : 'pause'}>{l}</button>
             ))}
           </div>
         )}
         {s.status === 'ended' && <span className="pill">service ended</span>}
         {pending > 0 && <span className="pill warn">{pending} awaiting approval</span>}
       </div>
-      {!replay && (
+      {!replay && isMgr && (
         <div className="scenarios" role="group" aria-label="Inject disruption">
           {(state.scenarios || []).map((x) => (
             <button key={x.name} className="inject" onClick={() => run(api.scenario(x.name))} title={x.label}>
@@ -85,13 +110,17 @@ export default function TopBar({ state, mode, setMode, alerts }) {
           <button onClick={() => setMode({ kind: 'live' })}>Back to live</button>
         ) : (
           <>
-            <button onClick={() => run(api.start({ speed: 10 }))}>New service</button>
+            {isMgr && <button onClick={() => setNewSvc(true)}>New service…</button>}
             <button onClick={() => run(api.services().then(setSvcs))}>Replay…</button>
           </>
         )}
+        <button onClick={() => setLayout(layout === 'stack' ? 'side' : 'stack')} title="Floor above the dashboard, or side by side"
+                aria-label="Toggle layout">{layout === 'stack' ? 'Side by side' : 'Floor on top'}</button>
+        <a className="btn" href="#/kds">Kitchen display</a>
+        {me?.role === 'admin' && <a className="btn" href="#/admin">Setup</a>}
         <a className="btn" href="#/online" target="_blank" rel="noreferrer">Online page ↗</a>
         <button onClick={alerts.toggle} aria-pressed={alerts.on} title="Chime and desktop notification for new approvals">{alerts.on ? 'Alerts on' : 'Alerts off'}</button>
-        <SignIn role={role} setRole={setRole} />
+        {me && <UserMenu me={me} onSignOut={onSignOut} />}
       </div>
       {svcs && (
         <div className="modal-back" onClick={() => setSvcs(null)}>
@@ -112,6 +141,7 @@ export default function TopBar({ state, mode, setMode, alerts }) {
           </div>
         </div>
       )}
+      {newSvc && <NewServiceDialog state={state} onClose={() => setNewSvc(false)} run={run} />}
       {err && <div className="toast" onClick={() => setErr('')}>{err}</div>}
     </header>
   )
