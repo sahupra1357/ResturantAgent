@@ -98,6 +98,9 @@ def test_salmon_short_end_to_end():
         assert "seared_salmon" not in svc.menu.specials, "the 86 ends any salmon special"
         pos = [d for d in decisions(svc, "place_po", "procurement") if (d.get("context") or {}).get("ingredient_id") == "salmon"]
         assert pos, "Procurement drafts a fallback PO"
+        short_pos = [d for d in pos if "short-shipping" in d["reason"]]
+        assert short_pos and all(any(t["tool"] == "observed_shortfall" and t["result"]["excluded_from_quotes"] for t in d["trace"])
+                                 for d in short_pos), "the shortfall that rules out the usual supplier is in the PO's evidence"
         first = pos[0]
         assert first["payload"]["supplier_id"] != "sup_freshcatch"
         assert first["needs_approval"] and first["status"] == "rejected" and "budget" in first["note"].lower()

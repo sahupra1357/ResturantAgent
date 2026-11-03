@@ -66,6 +66,31 @@ def touch(conn: sqlite3.Connection) -> None:
 # =========================================================================== defaults
 
 
+# The first catalog had five stations; the fryer was folded into sauté and garde manger renamed "cold". Databases seeded
+# then still cook dishes (and count shift cooks) on the old ids, which no longer exist: the kitchen raised KeyError: 'fry'.
+LEGACY_STATIONS = {"fry": "saute", "garde_manger": "cold"}
+
+
+def migrate_legacy_stations(conn: sqlite3.Connection) -> dict[str, str]:
+    """Move dishes, staff and shift counts off a legacy station id that is not a configured station onto its successor
+    (when that one is). Idempotent; a restaurant that really configured a 'fry' station keeps it."""
+    have = {r[0] for r in conn.execute("SELECT id FROM stations")}
+    moved = {}
+    for old, new in LEGACY_STATIONS.items():
+        if old in have or new not in have:
+            continue
+        n = conn.execute("UPDATE dishes SET station=? WHERE station=?", (new, old)).rowcount
+        n += conn.execute("UPDATE staff SET station=? WHERE station=?", (new, old)).rowcount
+        n += conn.execute("UPDATE roster SET station=? WHERE station=?", (new, old)).rowcount
+        n += conn.execute("INSERT INTO staff_shifts (date, meal_period, station, staff) SELECT date, meal_period, ?, staff "
+                          "FROM staff_shifts WHERE station=? ON CONFLICT (date, meal_period, station) "
+                          "DO UPDATE SET staff = staff + excluded.staff", (new, old)).rowcount
+        conn.execute("DELETE FROM staff_shifts WHERE station=?", (old,))
+        if n:
+            moved[old] = new
+    return moved
+
+
 def seed_defaults(conn: sqlite3.Connection) -> dict:
     """Fill empty admin tables from the built-in world (idempotent)."""
     from restaurant_ops.config import settings
@@ -93,6 +118,9 @@ def seed_defaults(conn: sqlite3.Connection) -> dict:
                          [(s, names.get(s, s), PARALLEL.get(s, 3), COOK_FACTOR.get(s, 2.4), cat.DEFAULT_STAFFING[s]["lunch"],
                            cat.DEFAULT_STAFFING[s]["dinner"], cat.DEFAULT_STAFFING[s]["late"]) for s in cat.STATIONS])
         out["stations"] = len(cat.STATIONS)
+    moved = migrate_legacy_stations(conn)
+    if moved:
+        out["legacy_stations"] = moved
     if not conn.execute("SELECT 1 FROM delivery_zones").fetchone():
         conn.executemany("INSERT INTO delivery_zones (id, label, fee, drive_min, min_order) VALUES (?,?,?,?,?)",
                          [(z, v["label"], v["fee"], v["drive_min"], 0.0) for z, v in settings.DELIVERY_ZONES.items()])

@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import TYPE_CHECKING, Any, TypedDict
 
 import sqlite3
@@ -69,6 +70,8 @@ def normalize_decision(v: dict) -> dict:
     v.pop("remaining_s", None)
     return v
 
+
+log = logging.getLogger("restaurant_ops.live.coordinator")
 
 class DState(TypedDict, total=False):
     decision: dict
@@ -197,6 +200,10 @@ class Coordinator:
     def _cfg(self, did: int) -> dict:
         return {"configurable": {"thread_id": f"{self.svc.service_id}:{did}"}}
 
+    def _paused_at_approval(self, did: int) -> bool:
+        snap = self.graph.get_state(self._cfg(did))
+        return tuple(snap.next) == ("approval",) and "decision" in (snap.values or {})
+
     # ------------------------------------------------------------------ public API
     def submit(self, prop: dict) -> dict:
         svc = self.svc
@@ -242,6 +249,15 @@ class Coordinator:
         d = self.decisions.get(int(decision_id))
         if d is None or d["status"] != "pending":
             raise KeyError(f"decision {decision_id} is not awaiting approval")
+        if not self._paused_at_approval(d["id"]):
+            # restored from a snapshot or the event log whose checkpoint is missing, or holds no decision (a run that
+            # stopped between writing the input checkpoint and pausing): resuming would run `check` on an empty state
+            # (KeyError: 'decision'). Re-seed the thread; nothing before the approval interrupt has side effects, so it
+            # re-checks and pauses there again.
+            seeded = self.graph.invoke({"decision": {k: v for k, v in d.items() if k != "remaining_min"}}, self._cfg(d["id"]))
+            if not self._paused_at_approval(d["id"]):  # blocked by the re-check: nothing to approve
+                self._finish(d, "blocked", seeded, note="re-checked after restore: blocked", approved=approved, by=by)
+                return d
         out = self.graph.invoke(Command(resume={"approved": approved, "note": note, "payload": payload or {}}), self._cfg(d["id"]))
         d.update(out.get("decision") or {})
         if by == "timeout":
@@ -263,16 +279,22 @@ class Coordinator:
             if d.get("timeout_min") is None or d.get("remaining_min") is None:  # restored from an older log or snapshot
                 normalize_decision(d)
             d["remaining_min"] = round(d["remaining_min"] - sim_dt_s / 60, 3)
-            if d["remaining_min"] <= 0:
-                ok = d.get("timeout_default") == "approve"
-                self.resolve(d["id"], ok, f"timeout after {d['timeout_min']:.0f} service min: safe default "
-                             f"({'approve' if ok else 'no action'})", by="timeout")
-            policy = self.svc.auto_policy
-            if policy and d["status"] == "pending":
-                ans = policy(self.view(d))
-                if ans is not None:
-                    self.resolve(d["id"], bool(ans[0]), ans[1] if len(ans) > 1 else "", ans[2] if len(ans) > 2 else None,
-                                 by="policy")
+            try:
+                if d["remaining_min"] <= 0:
+                    ok = d.get("timeout_default") == "approve"
+                    self.resolve(d["id"], ok, f"timeout after {d['timeout_min']:.0f} service min: safe default "
+                                 f"({'approve' if ok else 'no action'})", by="timeout")
+                policy = self.svc.auto_policy
+                if policy and d["status"] == "pending":
+                    ans = policy(self.view(d))
+                    if ans is not None:
+                        self.resolve(d["id"], bool(ans[0]), ans[1] if len(ans) > 1 else "", ans[2] if len(ans) > 2 else None,
+                                     by="policy")
+            except Exception as e:  # noqa: BLE001  one broken decision must not stop the service clock every tick
+                log.exception("decision #%s could not be resolved", d["id"])
+                if d["status"] == "pending":
+                    self._finish(d, "failed", {"result": {"error": f"{type(e).__name__}: {e}"}},
+                                 note="could not be resolved; no action taken", by="coordinator")
 
     # ------------------------------------------------------------------ internals
     def _finish(self, d: dict, status: str, out: dict, note: str, approved: bool | None = None, by: str = "") -> None:

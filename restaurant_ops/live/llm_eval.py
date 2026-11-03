@@ -5,15 +5,19 @@
     python -m restaurant_ops.live.llm_eval smoke            # one real review call with the configured provider
 
 A case is one Menu / Procurement / Forecasting proposal that a person (or a scripted manager policy, marked as such)
-decided on: label "keep" when it was approved, "drop" when it was rejected. `run` asks the reviewer about each case
-with the same prompt the live agents use and reports agreement with the manager, how many rejections it would have
-caught, latency and cost. The mock judge (keep everything, i.e. the rule-based behaviour) is the baseline a model has
+decided on: label "keep" when it was approved, "drop" when it was rejected. Each case carries the tool outputs the agent
+saw (its logged trace) and the rule's own reason (an earlier LLM rationale is stripped, so no verdict leaks). `run` asks
+the reviewer about each case with the same prompt the live agents use, with that trace as the situation, and reports
+agreement with the manager (over all cases, errors counted as the rule fallback, and over answered calls only), how many
+rejections it would have caught (all, and only those a person made: a scripted policy's reasons are not in the data),
+latency and cost. `--out` writes the per-case results. The mock judge (keep everything, i.e. the rule-based behaviour) is the baseline a model has
 to beat before the pilot widens. Live runs obey the same per-call timeout as the service and stop at the cost cap.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import re
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -23,6 +27,21 @@ from pathlib import Path
 from restaurant_ops.config import settings
 
 REVIEWED = ("menu", "procurement", "forecasting")
+SCRIPTED = ("policy",)  # resolved_by values that are a scripted manager, not a person
+_RULE_BASIS = re.compile(r"\(rule basis: (.*)\)\s*$", re.S)
+
+
+def rule_reason(reason: str) -> str:
+    """The rule-based reason without an earlier LLM review's rationale ("<rationale> (rule basis: <reason>)")."""
+    m = _RULE_BASIS.search(reason or "")
+    return m.group(1) if m else (reason or "")
+
+
+def situation_of(trace: list | None, now: str | None = None) -> dict:
+    """The logged tool calls as the reviewer's situation (what the agent saw when it proposed), with the service clock
+    at proposal time so the model does not judge dates against today's."""
+    return {**({"service_time": now} if now else {}), "tools": [{"tool": t.get("tool"), "args": t.get("args"), "result": t.get("result")} for t in (trace or [])
+                      if isinstance(t, dict)]}
 EVAL_PATH = settings.DATA_DIR / "evals" / "llm_review.jsonl"
 
 
@@ -48,7 +67,7 @@ def build(out: Path = EVAL_PATH, live_dir: Path | None = None) -> dict:
                 continue
             seen.add(key)
             cases.append({"case_id": f"{db.stem}:{d['id']}", "agent": d["agent"], "action_type": d["action_type"], "title": d["title"],
-                          "reason": d.get("reason", ""), "payload": d.get("payload", {}), "label": label, "manager_note": d.get("note", ""),
+                          "reason": rule_reason(d.get("reason", "")), "situation": situation_of(d.get("trace"), d.get("created_sim")), "payload": d.get("payload", {}), "label": label, "manager_note": d.get("note", ""),
                           "decided_by": d.get("resolved_by")})
     out.parent.mkdir(parents=True, exist_ok=True)
     with open(out, "w") as f:
@@ -63,7 +82,7 @@ def load(path: Path = EVAL_PATH) -> list[dict]:
         return [json.loads(l) for l in f if l.strip()]
 
 
-def run(path: Path = EVAL_PATH, judge: str = "mock", limit: int | None = None, reviewer=None) -> dict:
+def run(path: Path = EVAL_PATH, judge: str = "mock", limit: int | None = None, reviewer=None, out: Path | None = None) -> dict:
     """`reviewer(agent, situation, proposals)` -> {"judgment", "latency_ms", "tokens_in", "tokens_out"}; default the
     live agents' `_review`. judge='mock' keeps every candidate (the rule-based baseline)."""
     from restaurant_ops.live.agents.base import _review
@@ -75,12 +94,14 @@ def run(path: Path = EVAL_PATH, judge: str = "mock", limit: int | None = None, r
     pool = ThreadPoolExecutor(max_workers=1)
     for case in cases:
         cand = [{"action_type": case["action_type"], "title": case["title"], "payload": case["payload"], "reason": case["reason"]}]
+        error = False
         if judge == "mock":
             keep, why = True, "rule-based baseline keeps every candidate"
         else:
             if cost >= settings.LLM_MAX_COST_PER_SERVICE:
                 break
-            fut = pool.submit(reviewer, case["agent"], {"eval": True, "note": "historical decision"}, cand)
+            situation = case.get("situation") or {"note": "historical decision, no logged tool outputs"}
+            fut = pool.submit(reviewer, case["agent"], situation, cand)
             t0 = time.perf_counter()
             try:
                 r = fut.result(timeout=settings.LLM_TIMEOUT_S)
@@ -89,20 +110,32 @@ def run(path: Path = EVAL_PATH, judge: str = "mock", limit: int | None = None, r
                 cost += cost_of(r["tokens_in"], r["tokens_out"])
             except (FutTimeout, Exception) as e:  # noqa: BLE001  a failed call counts as "fall back to rules" (keep)
                 errors += 1
+                error = True
                 keep, why = True, f"error: {type(e).__name__} -> rule fallback"
                 lat.append((time.perf_counter() - t0) * 1000)
         results.append({"case_id": case["case_id"], "label": case["label"], "keep": keep, "agree": (case["label"] == "keep") == keep,
+                        "error": error, "decided_by": case.get("decided_by"), "agent": case["agent"], "title": case["title"],
                         "why": why})
     pool.shutdown(wait=False, cancel_futures=True)
+    if out:
+        out = Path(out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with open(out, "w") as f:
+            for r in results:
+                f.write(json.dumps(r, default=str) + "\n")
     n = len(results)
     drops = [r for r in results if r["label"] == "drop"]
     caught = sum(1 for r in drops if not r["keep"])
+    human_drops = [r for r in drops if r["decided_by"] not in SCRIPTED]
+    answered = [r for r in results if not r["error"]]
     false_drops = sum(1 for r in results if r["label"] == "keep" and not r["keep"])
     lat.sort()
     return {"judge": judge, "cases": n, "agreement_pct": round(100 * sum(r["agree"] for r in results) / n, 1) if n else None,
-            "rejections_caught": f"{caught}/{len(drops)}", "false_drops": false_drops, "errors": errors,
+            "answered_agreement_pct": round(100 * sum(r["agree"] for r in answered) / len(answered), 1) if answered else None,
+            "rejections_caught": f"{caught}/{len(drops)}",
+            "human_rejections_caught": f"{sum(1 for r in human_drops if not r['keep'])}/{len(human_drops)}", "false_drops": false_drops, "errors": errors,
             "p50_ms": lat[len(lat) // 2] if lat else None, "p95_ms": lat[int(len(lat) * 0.95)] if lat else None,
-            "cost": round(cost, 4), "results": results}
+            "cost": round(cost, 4), "results": results, **({"out": str(out)} if out else {})}
 
 
 SMOKE_SITUATION = {"salmon_on_hand_kg": 1.2, "salmon_portions_left": 6, "forecast_salmon_orders_tonight": 14,
@@ -230,6 +263,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--timeout", type=float, default=None, help="smoke: seconds to wait (default LLM_TIMEOUT_S)")
     ap.add_argument("--effort", default=None, help="smoke: Meta reasoning effort to try ('' = API default)")
+    ap.add_argument("--out", type=Path, default=None, help="run: write per-case results (jsonl) here")
     a = ap.parse_args(argv)
     if a.command == "smoke":
         r = smoke(a.timeout, a.effort)
@@ -238,7 +272,7 @@ def main(argv: list[str] | None = None) -> int:
     if a.command == "build":
         print(json.dumps(build(), indent=2))
     else:
-        r = run(judge=a.judge, limit=a.limit)
+        r = run(judge=a.judge, limit=a.limit, out=a.out)
         print(json.dumps({k: v for k, v in r.items() if k != "results"}, indent=2))
     return 0
 

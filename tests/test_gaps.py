@@ -362,3 +362,62 @@ def test_obsolete_env_keys_are_reported(monkeypatch):
     monkeypatch.setenv("APPROVAL_TIMEOUT_S", "120")
     found = config.obsolete_settings()
     assert {"MANAGER_TOKEN", "APPROVAL_TIMEOUT_S"} <= {k for k, _ in found}
+
+
+# =========================================================================== restored approvals without a checkpoint
+
+
+def test_pending_decision_without_its_checkpoint_still_resolves():
+    """A pending approval restored from a snapshot / the event log whose LangGraph checkpoint is missing used to crash
+    every tick on resume (KeyError: 'decision' in the check node) and stop the service clock."""
+    svc = make(policy=None)
+    try:
+        co = svc.coordinator
+
+        def pending(title, empty_checkpoint=False):
+            p = svc.agents["menu"].proposal("86_dish", {"dish_id": "seared_salmon", "date": svc.date.isoformat(),
+                                                        "meal_period": svc.period, "after_portions": 0}, title, "test", [])
+            d = co.submit(p)
+            assert d["status"] == "pending"
+            co.saver.delete_thread(co._cfg(d["id"])["configurable"]["thread_id"])
+            if empty_checkpoint:  # the state seen in the field: a checkpoint paused before `check` with no decision in it
+                co.graph.invoke({}, co._cfg(d["id"]), interrupt_before=["check"])
+                assert co.graph.get_state(co._cfg(d["id"])).next == ("check",)
+            assert not co._paused_at_approval(d["id"])
+            return d
+
+        a = co.resolve(pending("approve me")["id"], True, "ok", by="manager")
+        assert a["status"] == "executed" and "seared_salmon" in svc.menu.eighty_sixed
+
+        b = pending("let me time out", empty_checkpoint=True)
+        b["remaining_min"] = 0.01
+        co.tick(60)  # the approval timeout path that crashed in the server loop
+        assert b["status"] == "timeout"
+    finally:
+        svc.close()
+
+
+def test_legacy_station_ids_are_migrated(tmp_path):
+    """Databases seeded by the first catalog cook dishes on 'fry' / 'garde_manger', which the kitchen no longer knows
+    (KeyError: 'fry' on every order). seed_defaults moves them onto saute / cold and merges the shift cook counts."""
+    from restaurant_ops import admin as ADMIN
+    from restaurant_ops.db.connection import get_conn, init_db
+
+    c = get_conn(tmp_path / "old.db")
+    try:
+        init_db(c)
+        ADMIN.seed_defaults(c)
+        c.execute("INSERT OR REPLACE INTO dishes (id, name, category, price, station, is_cold, seasonal_months, prep_minutes, active) "
+                  "VALUES ('old_fries', 'Fries', 'side', 9, 'fry', 0, '', 1, 1), ('old_salad', 'Salad', 'starter', 12, 'garde_manger', 1, '', 2, 1)")
+        c.executemany("INSERT OR REPLACE INTO staff_shifts (date, meal_period, station, staff) VALUES ('2026-10-01', 'dinner', ?, ?)",
+                      [("saute", 2), ("fry", 1), ("garde_manger", 1)])
+        c.commit()
+        out = ADMIN.seed_defaults(c)
+        assert out.get("legacy_stations") == {"fry": "saute", "garde_manger": "cold"}
+        st = dict(c.execute("SELECT id, station FROM dishes WHERE id IN ('old_fries', 'old_salad')").fetchall())
+        assert st == {"old_fries": "saute", "old_salad": "cold"}
+        shifts = dict(c.execute("SELECT station, staff FROM staff_shifts WHERE date='2026-10-01'").fetchall())
+        assert shifts == {"saute": 3, "cold": 1}
+        assert "legacy_stations" not in ADMIN.seed_defaults(c)  # idempotent
+    finally:
+        c.close()
