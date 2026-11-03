@@ -561,3 +561,40 @@ The plan is 1000 x 700, with a waiting area by the entrance. Parties wait there:
 `waitlist_view` gives the reason. The 3D view queues parties in rows in the lobby with a name tag, and the 2D view
 draws them in the dashed waiting area.
 
+
+## Gap fixes after round 3
+
+- **Decisions of any era.** `coordinator.normalize_decision` brings any decision to the current shape: older
+  `timeout_s` / `remaining_s` countdowns, a missing `key`, `needs_approval` or `context`. Event-log recovery and
+  snapshot migration both call it. A legacy pending approval keeps the share of time it had left, and recovery counts
+  the service minutes since the proposal.
+- **No silent no-ops.** The coordinator blocks, at the check step, any action type the live service can't execute
+  (`no_executor`). It no longer records a missing executor as done.
+  - `live/handlers.py` holds an executor for every type in `core.actions.ACTION_TYPES`, except discount and refund,
+    which run inside payments.
+  - The new live executors:
+    - `reschedule_po` (needs approval)
+    - `substitute_ingredient`: tonight's recipe, stock bill of materials, catalog and allergen checks change
+      together
+    - `prep_list`: tonight it sets new pars and batches the difference; for a later service it saves the plan in
+      the master `config_kv`, and that service starts from it
+  - `adjust_forecast` is also written to the master database. Tomorrow's service is copied from it, so the
+    adjustment used to be lost. The latest live adjustment per date and period replaces the earlier one, because
+    they multiply.
+  - A test asserts both runtimes cover every action type.
+- **One implementation per action.** `core/actions.py` holds the database effects for both the batch supervisor
+  and the live handlers, which fixed live `substitute_supplier` not cancelling the PO it replaces. The two agent
+  runtimes stay separate on purpose: the batch day planner drives the baseline comparison, while the live agents
+  react to events. The unmounted batch HTTP app (`tools/api.py`) was removed.
+- **Docs and config agree.** A test checks that every setting named in the README and `.env.example` exists. The
+  server logs a warning at start for removed settings still present in the environment or `.env` (role tokens,
+  `APPROVAL_TIMEOUT_S`).
+- **Smaller modules.** `server.py` (153 lines) assembles the app from `live/api/`: hub, deps, models and routers by
+  area. `service.py` (426 lines) is composed of mixins (`floor_ops`, `order_flow`, `online_ops`, `views`), with
+  `world.py`, `recovery.py` and `handlers.py` alongside. Public names and every endpoint are unchanged.
+- **LLM path.** Tests drive the review through the real `_MetaChatOpenAI` / `_ToolCallingChatOpenAI` clients with
+  a mocked HTTP transport: request shape (json_schema vs tools), parsing, token usage, `llm_calls` rows and rule
+  fallback on HTTP errors. `llm_eval smoke` and the opt-in `tests/test_llm_live.py` make one real call.
+- **Test isolation.** The suite runs on a private copy of the master database. After each test it clears what that
+  test's services wrote into the master (live forecast adjustments, saved prep plans).
+

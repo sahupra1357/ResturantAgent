@@ -77,6 +77,10 @@ def migrate(blob: dict) -> dict:
         blob["version"] = v = 2
     if v != VERSION:
         raise ValueError(f"snapshot version {v} is newer than this code ({VERSION})")
+    from restaurant_ops.live.coordinator import normalize_decision
+
+    for d in (blob.get("coordinator") or {}).get("decisions", {}).values():  # any era -> the current decision shape
+        normalize_decision(d)
     return blob
 
 

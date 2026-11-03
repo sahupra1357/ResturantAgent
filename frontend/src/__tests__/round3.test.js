@@ -82,3 +82,15 @@ describe('store auth handling', () => {
     expect(s.connected).toBe(false)
   })
 })
+
+describe('approval countdown', () => {
+  it('reads service minutes, and legacy wall-second fields from old logs without NaN', async () => {
+    const { approvalMinutesLeft } = await import('../format.js')
+    expect(approvalMinutesLeft({ remaining_min: 12, timeout_min: 20 })).toBe(12)
+    expect(approvalMinutesLeft({ timeout_min: 20 })).toBe(20)
+    expect(approvalMinutesLeft({ remaining_s: 60, timeout_s: 120 })).toBe(1)
+    expect(approvalMinutesLeft({})).toBe(0)
+    // 30 wall seconds at 60x = 30 service minutes elapsed
+    expect(approvalMinutesLeft({ remaining_min: 40, receivedAt: 0 }, 30000, 60)).toBe(10)
+  })
+})

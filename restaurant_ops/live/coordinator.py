@@ -38,6 +38,38 @@ DB_STATUS = {"pending": "pending_approval", "executed": "executed", "approved": 
              "blocked": "blocked", "timeout": "rejected", "failed": "rejected", "checking": "proposed"}
 
 
+def normalize_decision(v: dict) -> dict:
+    """Bring a decision from any era (an event-log row, an old snapshot) to the current shape, in place.
+
+    Events before the service-minute timeouts carried `timeout_s` / `remaining_s` (wall seconds); very early ones
+    lack `key`, `needs_approval` or `context`. Everything the coordinator reads goes through here once, so tick(),
+    resolve() and the UI never meet a missing field. A pending decision keeps the share of its time that was left."""
+    v.setdefault("payload", {})
+    v.setdefault("title", v.get("action_type", ""))
+    v["key"] = v.get("key") or f"{v.get('action_type')}:{v.get('title')}"
+    for k, default in (("reason", ""), ("trace", []), ("tools", []), ("confidence", 0.0), ("timeout_default", "reject"),
+                       ("est_cost", 0.0), ("context", {}), ("mode", "rule"), ("violations", []), ("note", ""),
+                       ("merged", 0), ("edited", False), ("created_sim", None), ("resolved_sim", None), ("result", None),
+                       ("resolved_by", None)):
+        if v.get(k) is None and default is not None:
+            v[k] = default
+        v.setdefault(k, default)
+    if v.get("status") == "auto":
+        v["status"] = "executed"
+    if v.get("needs_approval") is None:
+        v["needs_approval"] = v.get("status") in ("pending", "rejected", "timeout")
+    if v.get("timeout_min") is None:
+        v["timeout_min"] = settings.APPROVAL_TIMEOUT_SIM_MIN if v["needs_approval"] else 0
+    if v.get("status") == "pending" and v.get("remaining_min") is None:
+        share = 1.0
+        if v.get("timeout_s") and v.get("remaining_s") is not None:  # legacy wall-second countdown: keep the share left
+            share = max(0.0, min(1.0, float(v["remaining_s"]) / float(v["timeout_s"])))
+        v["remaining_min"] = round(v["timeout_min"] * share, 3)
+    v.pop("timeout_s", None)
+    v.pop("remaining_s", None)
+    return v
+
+
 class DState(TypedDict, total=False):
     decision: dict
     violations: list
@@ -62,7 +94,7 @@ class Coordinator:
     def needs_approval(self, a: dict) -> bool:
         t, p = a["action_type"], a["payload"]
         if t in ("add_special", "86_dish", "allergen_swap", "comp", "substitute_ingredient", "add_staff", "donate_lots",
-                 "price_change", "discount", "refund"):
+                 "price_change", "discount", "refund", "reschedule_po"):
             return True
         if t in ("place_po", "substitute_supplier"):
             return C.total_of(a) > settings.LIVE_PO_APPROVAL_THRESHOLD
@@ -102,6 +134,9 @@ class Coordinator:
         return out
 
     def _check(self, a: dict) -> list[dict]:
+        if a["action_type"] not in self.handlers:  # never ask a manager to approve something nothing can carry out
+            return [{"code": "no_executor", "severity": "block",
+                     "message": f"the live service has no executor for {a['action_type']!r}"}]
         self.svc.flush()  # the checker reads through its own connection: make current stock visible
         viol = R.check_action(action={"action_type": a["action_type"], "payload": a["payload"], "agent": a["agent"],
                                       "est_cost": a.get("est_cost", 0)})
@@ -142,7 +177,7 @@ class Coordinator:
             d = state["decision"]
             fn = self.handlers.get(d["action_type"])
             try:
-                res = fn(d) if fn else {"recorded": True}
+                res = fn(d) if fn else {"error": f"no live executor for {d['action_type']!r}"}
             except Exception as e:  # noqa: BLE001
                 res = {"error": f"{type(e).__name__}: {e}"}
             return {"result": res}
@@ -225,10 +260,9 @@ class Coordinator:
         for d in list(self.decisions.values()):
             if d["status"] != "pending":
                 continue
-            if d.get("timeout_min") is None:  # decisions rebuilt from an older event log may lack it
-                d["timeout_min"] = settings.APPROVAL_TIMEOUT_SIM_MIN
-            left = d.get("remaining_min")
-            d["remaining_min"] = round((d["timeout_min"] if left is None else left) - sim_dt_s / 60, 3)
+            if d.get("timeout_min") is None or d.get("remaining_min") is None:  # restored from an older log or snapshot
+                normalize_decision(d)
+            d["remaining_min"] = round(d["remaining_min"] - sim_dt_s / 60, 3)
             if d["remaining_min"] <= 0:
                 ok = d.get("timeout_default") == "approve"
                 self.resolve(d["id"], ok, f"timeout after {d['timeout_min']:.0f} service min: safe default "
@@ -247,10 +281,11 @@ class Coordinator:
         d["violations"] = out.get("violations", d.get("violations", []))
         d["result"] = out.get("result")
         d["note"] = note
-        d["resolved_by"] = by or ("coordinator" if status in ("blocked", "executed") and not d["needs_approval"] else by)
+        d["resolved_by"] = by or ("coordinator" if status in ("blocked", "executed") and not d.get("needs_approval") else by)
         d["resolved_sim"] = svc.clock.iso()
-        self.open_by_key.pop(d["key"], None)
-        self.resolved_by_key[d["key"]] = {"t_min": svc.clock.t / 60, "decision": d}
+        key = d.get("key") or normalize_decision(d)["key"]
+        self.open_by_key.pop(key, None)
+        self.resolved_by_key[key] = {"t_min": svc.clock.t / 60, "decision": d}
         self._db(d)
         if status == "blocked":
             svc.metrics.decisions_blocked += 1

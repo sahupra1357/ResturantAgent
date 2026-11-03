@@ -84,7 +84,7 @@ export function LlmPanel({ state }) {
     <Panel title="LLM review (pilot)" right={v && <span className={`pill ${v.active ? 'ok' : ''}`}>{v.active ? 'active' : 'rule-based'}</span>}>
       {!v && <p className="muted small">Loading…</p>}
       {v && (<>
-        <p className="small">{v.active ? `${v.mode} reviews Menu, Procurement and Forecasting proposals (timeout ${v.timeout_s} s).` : `Rule-based fallback: ${v.why_not}.`}</p>
+        <p className="small">{v.active ? `${v.mode} reviews Menu, Procurement and Forecasting proposals (timeout ${v.timeout_s} s per call).` : `Rule-based fallback: ${v.why_not}.`}</p>
         <table className="grid small"><tbody>
           <tr><td>Calls</td><td>{v.calls} / {v.call_cap}</td><td>Failures</td><td>{v.failures}{v.tripped ? ' (breaker open)' : ''}</td></tr>
           <tr><td>Cost</td><td>{money(v.cost)} / {money(v.cost_cap)}</td><td>Skipped</td><td>{v.refused}</td></tr>

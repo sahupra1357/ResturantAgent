@@ -239,6 +239,27 @@ class Settings(BaseSettings):
         return int(self.SEATS * self.SEAT_TURNS[meal_period])
 
 
+# settings that were removed or renamed: still set in an environment or .env, they would be silently ignored
+OBSOLETE = {
+    "MANAGER_TOKEN": "role tokens were replaced by named users: sign in, and manage accounts in Setup > Users",
+    "SERVER_TOKEN": "role tokens were replaced by named users: sign in, and manage accounts in Setup > Users",
+    "KITCHEN_TOKEN": "role tokens were replaced by named users: sign in, and manage accounts in Setup > Users",
+    "APPROVAL_TIMEOUT_S": "approval timeouts count service minutes now: use APPROVAL_TIMEOUT_SIM_MIN",
+}
+
+
+def obsolete_settings(env_file: "str | Path | None" = None) -> list[tuple[str, str]]:
+    """[(key, what to do)] for removed settings found in the environment or the .env file."""
+    keys = set(os.environ)
+    path = Path(env_file) if env_file else PROJECT_ROOT / ".env"
+    if path.exists():
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                keys.add(line.split("=", 1)[0].replace("export ", "").strip())
+    return [(k, hint) for k, hint in OBSOLETE.items() if k in keys]
+
+
 def sim_start_from_db(db_path: "str | Path") -> date | None:
     """The first simulated day a DB was built for: meta.sim_start, else (older DBs) derived from its data.
 

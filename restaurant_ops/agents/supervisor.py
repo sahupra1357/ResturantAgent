@@ -25,6 +25,7 @@ from restaurant_ops.agents import decision_log as DL
 from restaurant_ops.agents import forecast_analyst, inventory_agent, menu_agent, prep_planner, purchasing_agent
 from restaurant_ops.agents.state import AGENT_ORDER, OpsState, replace_agent
 from restaurant_ops.config import settings
+from restaurant_ops.core import actions as ACT
 from restaurant_ops.tools import registry as R
 
 # event kind -> agents to re-run when the LLM supervisor is unavailable (mock mode or model error)
@@ -196,70 +197,30 @@ def approval(state: OpsState) -> dict:
 # =========================================================================== execute
 
 
-def _exec_place_po(p: dict, a: dict, did: int, today: str) -> dict:
-    return R.send_po(supplier_id=p["supplier_id"], delivery_date=p["delivery_date"], lines=p["lines"], decision_id=did)
-
-
-def _exec_substitute_supplier(p: dict, a: dict, did: int, today: str) -> dict:
-    res = _exec_place_po(p, a, did, today)
-    if p.get("po_id") and p.get("cancel_original"):
-        with R.connection() as c:
-            c.execute("UPDATE purchase_orders SET status='cancelled' WHERE po_id=? AND status IN ('sent','pending_approval','draft')",
-                      (p["po_id"],))
-            c.commit()
-        res["cancelled"] = p["po_id"]
-    return res
-
-
-def _exec_reschedule_po(p: dict, a: dict, did: int, today: str) -> dict:
-    with R.connection() as c:
-        c.execute("UPDATE purchase_orders SET expected_delivery=? WHERE po_id=?", (p["new_delivery_date"], p["po_id"]))
-        c.commit()
-    return {"po_id": p["po_id"], "expected_delivery": p["new_delivery_date"]}
-
-
-def _set_menu(status: str, p: dict, a: dict, note: str, today: str) -> dict:
-    day = p.get("date") or today
-    with R.connection() as c:
-        c.execute("INSERT OR REPLACE INTO menu_state (date, dish_id, status, note) VALUES (?,?,?,?)",
-                  (day, p["dish_id"], status, note[:300]))
-        c.commit()
-    return {"date": day, "dish_id": p["dish_id"], "status": status}
-
-
 def _exec_add_special(p: dict, a: dict, did: int, today: str) -> dict:
     per = f" ({p['meal_period']})" if p.get("meal_period") else ""
-    return _set_menu("special", p, a, f"{p.get('portions')} portions{per}: {a.get('rationale', '')}", today)
+    return ACT.set_menu(p.get("date") or today, p["dish_id"], "special", f"{p.get('portions')} portions{per}: {a.get('rationale', '')}")
 
 
 def _exec_86(p: dict, a: dict, did: int, today: str) -> dict:
     per = f" ({p['meal_period']})" if p.get("meal_period") else ""
-    return _set_menu("86", p, a, f"86'd{per}: {a.get('rationale', '')}", today)
+    return ACT.set_menu(p.get("date") or today, p["dish_id"], "86", f"86'd{per}: {a.get('rationale', '')}")
 
 
-def _exec_discard_lot(p: dict, a: dict, did: int, today: str) -> dict:
-    with R.connection() as c:
-        lot = c.execute("SELECT * FROM lots WHERE lot_id=?", (p["lot_id"],)).fetchone()
-        qty = float(p.get("qty") or lot["qty"])
-        full = qty >= float(lot["qty"]) - 1e-9
-        c.execute("INSERT INTO waste_log (date, lot_id, ingredient_id, qty, value, reason) VALUES (?,?,?,?,?,?)",
-                  (today, lot["lot_id"], lot["ingredient_id"], qty, round(qty * float(lot["unit_cost"]), 2), p.get("reason", "discarded")))
-        if full:
-            c.execute("UPDATE lots SET status='discarded' WHERE lot_id=?", (lot["lot_id"],))
-        else:
-            c.execute("UPDATE lots SET qty=qty-? WHERE lot_id=?", (qty, lot["lot_id"]))
-        c.commit()
-    return {"lot_id": p["lot_id"], "discarded_qty": qty}
-
-
-def _exec_noop(p: dict, a: dict, did: int, today: str) -> dict:
-    return {"recorded": True}  # prep_list / adjust_forecast / flag_variance / substitute_ingredient live in `decisions`
-
-
-HANDLERS = {"place_po": _exec_place_po, "substitute_supplier": _exec_substitute_supplier, "reschedule_po": _exec_reschedule_po,
-            "add_special": _exec_add_special, "86_dish": _exec_86, "discard_lot": _exec_discard_lot,
-            "prep_list": _exec_noop, "adjust_forecast": _exec_noop, "flag_variance": _exec_noop,
-            "substitute_ingredient": _exec_noop}
+# Batch executors (shared DB effects live in core/actions.py). The batch planner proposes only the types below; a
+# prep list or a substitution for a future day is a plan that `decisions` records (prep and forecasting read it).
+HANDLERS = {
+    "place_po": lambda p, a, did, today: ACT.place_po(p, did),
+    "substitute_supplier": lambda p, a, did, today: ACT.substitute_supplier(p, did),
+    "reschedule_po": lambda p, a, did, today: ACT.reschedule_po(p),
+    "add_special": _exec_add_special,
+    "86_dish": _exec_86,
+    "discard_lot": lambda p, a, did, today: ACT.discard_lot(p, today),
+    "adjust_forecast": lambda p, a, did, today: ACT.record(p),
+    "flag_variance": lambda p, a, did, today: ACT.record(p),
+    "prep_list": lambda p, a, did, today: ACT.record(p),
+    "substitute_ingredient": lambda p, a, did, today: ACT.record(p),
+}
 
 
 def execute(state: OpsState) -> dict:
