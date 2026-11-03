@@ -225,7 +225,10 @@ class Coordinator:
         for d in list(self.decisions.values()):
             if d["status"] != "pending":
                 continue
-            d["remaining_min"] = round(d.get("remaining_min", d["timeout_min"]) - sim_dt_s / 60, 3)
+            if d.get("timeout_min") is None:  # decisions rebuilt from an older event log may lack it
+                d["timeout_min"] = settings.APPROVAL_TIMEOUT_SIM_MIN
+            left = d.get("remaining_min")
+            d["remaining_min"] = round((d["timeout_min"] if left is None else left) - sim_dt_s / 60, 3)
             if d["remaining_min"] <= 0:
                 ok = d.get("timeout_default") == "approve"
                 self.resolve(d["id"], ok, f"timeout after {d['timeout_min']:.0f} service min: safe default "

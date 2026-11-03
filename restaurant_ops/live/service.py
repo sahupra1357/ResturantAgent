@@ -310,6 +310,8 @@ class Service:
                 views[int(p["id"])] = {**views.get(int(p["id"]), {}), **p}
         for did, v in views.items():
             v.setdefault("context", {})
+            if v.get("timeout_min") is None:  # older logs did not record it
+                v["timeout_min"] = settings.APPROVAL_TIMEOUT_SIM_MIN if v.get("needs_approval", True) else 0
             if v["status"] == "auto":
                 v["status"] = "executed"
             svc.coordinator.decisions[did] = v
