@@ -254,7 +254,7 @@ def test_live_review_through_the_provider_client(monkeypatch, provider):
         handler = lambda req: httpx.Response(200, json=_openai_response(tool_args=judgment))  # noqa: E731
         model = llm._ToolCallingChatOpenAI(model="gpt-4.1", api_key="test", base_url="https://model.test/v1",
                                            http_client=_client(handler, seen))
-    monkeypatch.setattr(llm, "get_llm", lambda: model)
+    monkeypatch.setattr(llm, "get_review_llm", lambda: model)
     from restaurant_ops.live.llm_eval import SMOKE_CANDIDATES, SMOKE_SITUATION
 
     r = _review("menu", SMOKE_SITUATION, SMOKE_CANDIDATES)
@@ -292,7 +292,7 @@ def test_live_service_with_a_provider_records_calls_and_falls_back(monkeypatch):
 
     model = llm._MetaChatOpenAI(model="muse-spark-1.3", api_key="test", base_url="https://model.test/v1", max_retries=0,
                                 http_client=_client(handler, seen))
-    monkeypatch.setattr(llm, "get_llm", lambda: model)
+    monkeypatch.setattr(llm, "get_review_llm", lambda: model)
     monkeypatch.setattr(settings, "LLM_MODE", "live")
 
     def drain(svc):

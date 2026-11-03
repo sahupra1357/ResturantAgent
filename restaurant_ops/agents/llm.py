@@ -103,21 +103,43 @@ def _no_temperature(model: str) -> bool:
     return model.startswith(("o1", "o3", "o4", "gpt-5"))
 
 
-@lru_cache(maxsize=1)
-def get_llm() -> BaseChatModel:
-    """The shared chat model (temperature 0 where supported). Only called in live mode."""
+def _build(timeout: float | None = None, max_retries: int | None = None, reasoning_effort: str | None = None) -> BaseChatModel:
     provider, model = settings.LLM_PROVIDER, settings.model_name
+    limits: dict[str, Any] = {}
+    if timeout is not None:
+        limits["timeout"] = timeout
+    if max_retries is not None:
+        limits["max_retries"] = max_retries
     if provider == "meta":
         # Muse Spark is tuned for its default sampling, so no temperature (per the Model API docs)
-        kwargs = {"model": model, "api_key": settings.META_API_KEY, "base_url": settings.META_BASE_URL}
-        if settings.META_REASONING_EFFORT:
-            kwargs["reasoning_effort"] = settings.META_REASONING_EFFORT
+        kwargs = {"model": model, "api_key": settings.META_API_KEY, "base_url": settings.META_BASE_URL, **limits}
+        effort = settings.META_REASONING_EFFORT if reasoning_effort is None else reasoning_effort
+        if effort:
+            kwargs["reasoning_effort"] = effort
         return _MetaChatOpenAI(**kwargs)
     if provider == "openai":
-        kwargs: dict[str, Any] = {"model": model, "api_key": settings.OPENAI_API_KEY}
+        kwargs = {"model": model, "api_key": settings.OPENAI_API_KEY, **limits}
         if settings.OPENAI_BASE_URL:
             kwargs["base_url"] = settings.OPENAI_BASE_URL
         if not _no_temperature(model):
             kwargs["temperature"] = 0
         return _ToolCallingChatOpenAI(**kwargs)
+    if provider == "anthropic":
+        return init_chat_model(f"{provider}:{model}", temperature=0, **limits)
     return init_chat_model(f"{provider}:{model}", temperature=0)
+
+
+@lru_cache(maxsize=1)
+def get_llm() -> BaseChatModel:
+    """The shared chat model for the batch planning agents (temperature 0 where supported). Only called in live mode."""
+    return _build()
+
+
+@lru_cache(maxsize=1)
+def get_review_llm() -> BaseChatModel:
+    """The model behind the live review (Menu / Procurement / Forecasting proposals). The service waits at most
+    LLM_TIMEOUT_S for it, so the HTTP request times out then too (otherwise the worker thread keeps waiting after the
+    service gave up), SDK retries are off by default (LLM_MAX_RETRIES), and Meta reasoning effort is
+    META_REVIEW_REASONING_EFFORT ("low" by default)."""
+    return _build(timeout=settings.LLM_TIMEOUT_S, max_retries=settings.LLM_MAX_RETRIES,
+                  reasoning_effort=settings.META_REVIEW_REASONING_EFFORT)

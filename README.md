@@ -329,13 +329,28 @@ uv run python -m restaurant_ops.live.llm_eval build
 uv run python -m restaurant_ops.live.llm_eval run --judge live --limit 50
 ```
 
-Before a pilot, check the provider end to end with one real review call. It goes through the same client, structured
-output and token accounting as the service, and prints the judgment, latency, tokens and cost (exit code 1 on
-failure):
+Before a pilot, check the provider end to end:
 
 ```bash
 uv run python -m restaurant_ops.live.llm_eval smoke
 ```
+
+It prints the settings it used, then runs two timed stages. A plain one-word request (`ping`) checks the endpoint,
+key and the model's basic speed. One real review (`review`) goes through the same client, structured output and token
+accounting as the service. On failure it names the kind of error (timeout, auth, not found, rejected, connection) and
+suggests a fix. Exit code 1 means it failed. To try other values without editing `.env`:
+
+```bash
+uv run python -m restaurant_ops.live.llm_eval smoke --timeout 60 --effort low
+```
+
+The live review client is separate from the batch agents' client:
+- its HTTP request times out at `LLM_TIMEOUT_S`, so a worker never keeps waiting after the service has given up
+- SDK retries are off (`LLM_MAX_RETRIES=0`)
+- Meta reasoning effort is `META_REVIEW_REASONING_EFFORT` (`low` by default)
+
+If the review only fits with more time, measure it with `--timeout 60` and set `LLM_TIMEOUT_S` above that. Proposals
+wait for the review on the live floor, so keep it short.
 
 The same check runs as a test when you opt in (it is skipped without a key):
 

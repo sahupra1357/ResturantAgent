@@ -115,32 +115,112 @@ SMOKE_CANDIDATES = [
 ]
 
 
-def smoke() -> dict:
-    """One real call through the live review path (`agents/base._review`): the provider client, structured output
-    parsing and token accounting. Needs LLM_MODE=live (or an API key) and the provider settings in .env."""
+def _classify(e: BaseException) -> tuple[str, str]:
+    """(kind, detail) of a provider error, from the exception class names (no SDK import needed)."""
+    names = {c.__name__ for c in type(e).__mro__}
+    detail = f"{type(e).__name__}: {e}"[:400]
+    if names & {"APITimeoutError", "TimeoutException", "ReadTimeout", "ConnectTimeout", "TimeoutError"}:
+        return "timeout", detail
+    if "AuthenticationError" in names or "PermissionDeniedError" in names:
+        return "auth", detail
+    if "NotFoundError" in names:
+        return "not_found", detail
+    if "BadRequestError" in names or "UnprocessableEntityError" in names:
+        return "rejected", detail
+    if "RateLimitError" in names:
+        return "rate_limit", detail
+    if names & {"APIConnectionError", "ConnectError"}:
+        return "connection", detail
+    return "error", detail
+
+
+def _timed(fn, timeout: float) -> dict:
+    """Run fn on a worker thread with a hard wait limit (the HTTP client has the same timeout)."""
+    pool = ThreadPoolExecutor(max_workers=1)
+    t0 = time.perf_counter()
+    fut = pool.submit(fn)
+    try:
+        val = fut.result(timeout=timeout + 2)
+        return {"ok": True, "seconds": round(time.perf_counter() - t0, 2), "value": val}
+    except FutTimeout:
+        return {"ok": False, "seconds": round(time.perf_counter() - t0, 2), "kind": "timeout", "error": f"no answer in {timeout}s"}
+    except Exception as e:  # noqa: BLE001
+        kind, detail = _classify(e)
+        return {"ok": False, "seconds": round(time.perf_counter() - t0, 2), "kind": kind, "error": detail}
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
+def _hint(ping: dict, review: dict | None, timeout: float, effort: str) -> str:
+    if ping.get("kind") == "auth":
+        return "the API key was refused: check META_API_KEY (or the key of LLM_PROVIDER) in .env"
+    if ping.get("kind") == "not_found":
+        return "endpoint or model not found: check META_BASE_URL / META_MODEL (LLM_MODEL)"
+    if ping.get("kind") == "connection":
+        return "cannot reach the endpoint: check META_BASE_URL, network or proxy"
+    if ping.get("kind") == "rejected":
+        return ("the request was rejected; if it mentions reasoning_effort, try --effort '' (API default) or another "
+                "value your model accepts")
+    if not ping["ok"]:
+        return (f"even a one-word reply took longer than {timeout}s: the model or endpoint is slow right now; measure it "
+                f"with --timeout 60, then set LLM_TIMEOUT_S above that (and/or a lower --effort)")
+    if review and not review["ok"] and review.get("kind") == "timeout":
+        return (f"plain replies are fine ({ping['seconds']}s) but the structured review needs more than {timeout}s at "
+                f"reasoning effort '{effort or 'API default'}': try --effort low (or minimal), or measure with --timeout 60 "
+                f"and raise LLM_TIMEOUT_S")
+    if review and not review["ok"] and review.get("kind") == "rejected":
+        return "the structured-output request was rejected (response_format json_schema); the error says which part"
+    if review and not review["ok"]:
+        return "the review call failed; see review.error"
+    return ""
+
+
+def smoke(timeout: float | None = None, effort: str | None = None) -> dict:
+    """One real call through the live review path (`agents/base._review`), preceded by a plain one-word request so a
+    failure can be placed: endpoint / key / model speed vs the structured review itself. `timeout` and `effort`
+    override LLM_TIMEOUT_S and META_REVIEW_REASONING_EFFORT for this run only."""
+    from langchain_core.messages import HumanMessage
+
     from restaurant_ops.agents import llm
     from restaurant_ops.live.agents.base import _review
     from restaurant_ops.live.llm_guard import cost_of
 
-    out = {"provider": llm.describe(), "mode": "mock" if llm.is_mock() else "live"}
+    timeout = float(timeout or settings.LLM_TIMEOUT_S)
+    effort = settings.META_REVIEW_REASONING_EFFORT if effort is None else effort
+    meta = settings.LLM_PROVIDER == "meta"
+    out = {"provider": llm.describe(), "mode": "mock" if llm.is_mock() else "live",
+           "settings": {"base_url": settings.META_BASE_URL if meta else (settings.OPENAI_BASE_URL or None),
+                        "timeout_s": timeout, "max_retries": settings.LLM_MAX_RETRIES,
+                        "reasoning_effort": (effort or "API default") if meta else None}}
     if llm.is_mock():
         return {**out, "ok": False, "error": "mock mode: set LLM_MODE=live and the provider's API key"}
-    pool = ThreadPoolExecutor(max_workers=1)
-    fut = pool.submit(_review, "menu", SMOKE_SITUATION, SMOKE_CANDIDATES)
     try:
-        r = fut.result(timeout=settings.LLM_TIMEOUT_S)
-    except FutTimeout:
-        return {**out, "ok": False, "error": f"timeout after {settings.LLM_TIMEOUT_S}s"}
+        model = llm._build(timeout=timeout, max_retries=settings.LLM_MAX_RETRIES, reasoning_effort=effort)
     except Exception as e:  # noqa: BLE001
-        return {**out, "ok": False, "error": f"{type(e).__name__}: {e}"[:500]}
-    finally:
-        pool.shutdown(wait=False, cancel_futures=True)
+        return {**out, "ok": False, "error": f"could not create the client: {type(e).__name__}: {e}"[:400]}
+
+    ping = _timed(lambda: model.invoke([HumanMessage(content="Reply with the single word OK.")]), timeout)
+    if ping["ok"]:
+        ping["reply"] = str(getattr(ping.pop("value"), "content", ""))[:40]
+    out["ping"] = ping
+    if not ping["ok"]:
+        return {**out, "ok": False, "error": f"ping: {ping['error']}", "hint": _hint(ping, None, timeout, effort)}
+
+    review = _timed(lambda: _review("menu", SMOKE_SITUATION, SMOKE_CANDIDATES, model=model), timeout)
+    if not review["ok"]:
+        out["review"] = review
+        return {**out, "ok": False, "error": f"review: {review['error']}", "hint": _hint(ping, review, timeout, effort)}
+    r = review.pop("value")
     j = r["judgment"]
     valid = [i for i in (j.keep or []) if 0 <= i < len(SMOKE_CANDIDATES)]
-    return {**out, "ok": True, "keep": valid, "ignored_indices": sorted(set(j.keep or []) - set(valid)), "rationale": j.rationale,
-            "confidence": j.confidence, "latency_ms": r["latency_ms"], "tokens_in": r["tokens_in"], "tokens_out": r["tokens_out"],
-            "cost": round(cost_of(r["tokens_in"], r["tokens_out"]), 6),
-            "usage_reported": bool(r["tokens_in"] or r["tokens_out"])}
+    out["review"] = {**review, "keep": valid, "ignored_indices": sorted(set(j.keep or []) - set(valid)), "rationale": j.rationale,
+                     "confidence": j.confidence, "tokens_in": r["tokens_in"], "tokens_out": r["tokens_out"],
+                     "cost": round(cost_of(r["tokens_in"], r["tokens_out"]), 6), "usage_reported": bool(r["tokens_in"] or r["tokens_out"])}
+    margin = timeout - review["seconds"]
+    out["ok"] = True
+    out["note"] = (f"review answered in {review['seconds']}s of the {timeout}s budget" +
+                   ("; that is close to the limit, consider a higher LLM_TIMEOUT_S" if margin < timeout * 0.25 else ""))
+    return out
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -148,9 +228,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("command", choices=["build", "run", "smoke"])
     ap.add_argument("--judge", choices=["mock", "live"], default="mock")
     ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--timeout", type=float, default=None, help="smoke: seconds to wait (default LLM_TIMEOUT_S)")
+    ap.add_argument("--effort", default=None, help="smoke: Meta reasoning effort to try ('' = API default)")
     a = ap.parse_args(argv)
     if a.command == "smoke":
-        r = smoke()
+        r = smoke(a.timeout, a.effort)
         print(json.dumps(r, indent=2))
         return 0 if r["ok"] else 1
     if a.command == "build":
