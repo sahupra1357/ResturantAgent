@@ -533,3 +533,36 @@ def test_llm_eval_set_from_logged_services(tmp_path, master):
                                                                           "tokens_in": 10, "tokens_out": 5})
     assert drop_all["rejections_caught"] == f"{b['drop']}/{b['drop']}" and drop_all["false_drops"] == b["keep"]
     assert drop_all["p50_ms"] == 5 and drop_all["cost"] > 0
+    seen = []
+    llm_eval.run(out, judge="live", reviewer=lambda a, s, p: seen.append(s) or {"judgment": Judgment(keep=[0]), "latency_ms": 5,
+                                                                                "tokens_in": 1, "tokens_out": 1})
+    assert seen and all(s.get("tools") for s in seen), "the reviewer sees the logged tool outputs, not a placeholder"
+    assert all("rule basis" not in c["reason"] for c in llm_eval.load(out))
+
+
+def test_llm_eval_strips_leaks_and_scores_errors_apart(tmp_path):
+    import json
+
+    from restaurant_ops.live import llm_eval
+    from restaurant_ops.live.agents.base import Judgment
+
+    assert llm_eval.rule_reason("Keep action 0 because X. (rule basis: 6 left vs 14 (P90))") == "6 left vs 14 (P90)"
+    assert llm_eval.rule_reason("6 left vs 14") == "6 left vs 14"
+    cases = [{"case_id": f"c{i}", "agent": "menu", "action_type": "86_dish", "title": f"t{i}", "reason": "r", "payload": {},
+              "situation": {"tools": [{"tool": "x", "result": i}]}, "label": lab, "decided_by": by}
+             for i, (lab, by) in enumerate([("keep", "manager"), ("keep", "manager"), ("drop", "policy"), ("drop", "manager")])]
+    path = tmp_path / "e.jsonl"
+    path.write_text("".join(json.dumps(c) + "\n" for c in cases))
+
+    def reviewer(agent, situation, cand):
+        i = situation["tools"][0]["result"]
+        if i == 1:
+            raise TimeoutError("slow")
+        return {"judgment": Judgment(keep=[] if i == 3 else [0]), "latency_ms": 5, "tokens_in": 1, "tokens_out": 1}
+
+    r = llm_eval.run(path, judge="live", reviewer=reviewer, out=tmp_path / "res.jsonl")
+    assert r["errors"] == 1 and r["agreement_pct"] == 75.0  # the timed-out keep counts as the rule fallback
+    assert r["answered_agreement_pct"] == round(100 * 2 / 3, 1)
+    assert r["rejections_caught"] == "1/2" and r["human_rejections_caught"] == "1/1"
+    rows = [json.loads(l) for l in (tmp_path / "res.jsonl").read_text().splitlines()]
+    assert len(rows) == 4 and rows[1]["error"] and "TimeoutError" in rows[1]["why"]

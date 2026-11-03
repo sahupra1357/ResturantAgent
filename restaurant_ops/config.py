@@ -139,7 +139,7 @@ class Settings(BaseSettings):
     SNAPSHOT_KEEP: int = 3            # rotated service snapshots
 
     # --- LLM pilot guard ---
-    LLM_TIMEOUT_S: float = 12.0                # live review: the HTTP request timeout and the service's wait
+    LLM_TIMEOUT_S: float = 20.0                # live review: the HTTP request timeout and the service's wait (eval p95 ~14s at low effort)
     LLM_MAX_RETRIES: int = 0                   # live review: SDK retries inside that budget (a retry rarely fits)
     LLM_MAX_CALLS_PER_SERVICE: int = 150
     LLM_MAX_COST_PER_SERVICE: float = 2.0      # USD

@@ -140,6 +140,10 @@ class ProcurementAgent(LiveAgent):
         exclude = set()
         if p.get("shortage"):
             exclude.add(p["shortage"]["supplier_id"])
+            # the live shortfall is an observation, not a tool output: record it so a reviewer (live LLM, eval, manager)
+            # sees why the cheaper quote below is passed over; quotes still show the supplier's historical fill rate
+            trace.append({"tool": "observed_shortfall", "args": {"ingredient_id": ing},
+                          "result": {**p["shortage"], "excluded_from_quotes": True}})
         self.handled[ing] = {"replans": 0, "excluded": set(exclude), "shortage_done": bool(p.get("shortage"))}
         if gap["gap"] <= 0:
             self.log(f"{p['ingredient']}: low tonight ({p['remaining_portions']} {p['dish']} left) but open POs cover "

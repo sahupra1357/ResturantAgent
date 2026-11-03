@@ -41,8 +41,11 @@ class ServiceError(RuntimeError):
 def apply_config(conn) -> dict:
     """Load the admin configuration of `conn` into the runtime catalog (dishes, ingredients, suppliers, stations) and
     the forecaster's dish list. Called when a service starts."""
+    from restaurant_ops import admin as ADMIN
     from restaurant_ops.core import forecasting
 
+    if ADMIN.migrate_legacy_stations(conn):  # a service DB copied before the migration (resumed / recovered services)
+        conn.commit()
     out = cat.reload_from_db(conn)
     forecasting.refresh_catalog()
     DISH_VIEW.clear()
