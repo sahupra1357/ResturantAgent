@@ -114,7 +114,7 @@ Every Python file, grouped by package, with what it takes in and gives back.
 | `core/menu.py` | Recipes, margins, allergens, feasible portions | dish → numbers |
 | `core/prep.py` | Prep quantities, station load, station staff | date, period → per-station list |
 | `tools/registry.py` | Wraps core as tools; per-agent toolsets | tool call → JSON dict |
-| `tools/api.py` | FastAPI over the same functions (batch side) | HTTP → JSON |
+| `core/actions.py` | DB effects of every action type, shared by the batch planner and the live service; `ACTION_TYPES` | checked action → DB change |
 
 ### Real-time service — `restaurant_ops/live/`
 
@@ -138,10 +138,15 @@ Every Python file, grouped by package, with what it takes in and gives back.
 | `agents/forecasting.py` | Forecasting agent | 15-min tick → `forecast.updated`, `forecast.miss` |
 | `agents/procurement.py` | Procurement agent | `stock.low` / miss → draft PO, re-plan on rejection |
 | `agents/menu.py` | Menu agent | `stock.low` / `lot.expiring` / quarantine → 86s and specials |
-| `coordinator.py` | LangGraph per decision: check → approval → verify → execute | proposal → decision |
+| `coordinator.py` | LangGraph per decision: check → approval → verify → execute; `normalize_decision` for decisions of any era | proposal → decision |
+| `handlers.py` | The live executor of every action type (blocked at check time when one is missing) | approved decision → effect |
 | `scenarios.py` | Five live disruptions | name → world change + events |
-| `service.py` | `Service`: the orchestrator that owns everything above | wall dt → one step of service |
-| `server.py` | FastAPI + WebSockets + the built React app | HTTP / WS ↔ service |
+| `service.py` | `Service`: lifecycle, step loop, runtime wiring; composed of the mixins below | wall dt → one step of service |
+| `world.py` | Tuning constants, `DISH_VIEW`, `ServiceError`, `apply_config` | — |
+| `floor_ops.py`, `order_flow.py`, `online_ops.py`, `views.py` | `Service` mixins: guests and seating, order flow, online channel, analytics / report / snapshot | — |
+| `recovery.py` | Restore from a snapshot (`resume`) or from the DB and event log (`recover_from_log`) | service id → running service |
+| `server.py` | FastAPI app: lifespan, audit middleware, routers, the built React app | HTTP / WS ↔ service |
+| `api/` | `hub` (service + WebSocket fan-out), `deps` (sessions, roles, CSRF), `models`, `routes_*` by area, `ws` | HTTP / WS ↔ service |
 | `run.py` | Headless seeded runner with manager policies | CLI → timeline + KPIs |
 | `replay.py` | `fold(events)`, list and load logged services | event log → rebuilt state |
 
@@ -442,7 +447,7 @@ T_ready = t_now + max_i (W_s(i) + P_i) + B          (B = 3-minute packing buffer
 
 ## Backend API and React app
 
-### Backend — `live/server.py`
+### Backend — `live/server.py` and `live/api/`
 
 `uv run python -m restaurant_ops.live.server` serves on `http://127.0.0.1:8000` (`LIVE_HOST`, `LIVE_PORT`). On startup a `Hub` starts a dinner service at 10x (seeding the DB first if it's missing) and runs a 100 ms clock loop that calls `svc.advance(...)`. One service runs per process.
 
@@ -619,7 +624,7 @@ State stores these as plain dicts so the SQLite checkpointer can save them. When
 
 **Live `ToolBox`** (`live/tools.py`) exposes the live agents' tools by name, recording each call in the proposal's trace. Stock-dependent registry tools are called uncached (`fresh(...)`) because the live service changes stock every few seconds. It also holds the order parser: `parse_mods` maps guest text ("nut allergy", "coeliac", "no garlic") to allergen codes and ingredients to remove, and `allergen_resolution` / `safe_alternatives` decide whether a conflict can be fixed by leaving out garnish or needs a swap.
 
-`tools/api.py` exposes the registry over HTTP for the batch side (`uv run uvicorn restaurant_ops.tools.api:app`), plus `/decisions`, `/trace`, `/kpis` and `/cycle/run`, `/cycle/resume`, `/cycle/pending`.
+The batch side has no HTTP API (the former `tools/api.py` was never mounted and was removed); run batch days with `python -m restaurant_ops.sim.run`.
 
 ## Deterministic core
 

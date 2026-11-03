@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api.js'
-import { AGENT_LABEL, STATION_LABEL, describe, hhmm, money, num } from '../format.js'
+import { AGENT_LABEL, STATION_LABEL, approvalMinutesLeft, describe, hhmm, money, num } from '../format.js'
 import { useNow } from '../store.js'
 import { ChecksPanel, GuestsPanel, HostPanel } from './FrontOfHouse.jsx'
 import { MenuEngineeringPanel, ReportPanel, SuppliersPanel } from './Insights.jsx'
@@ -75,7 +75,7 @@ function ApprovalCard({ d, state }) {
   const [err, setErr] = useState('')
   const speed = state.clock?.speed || 0
   // the timeout runs in service minutes (frozen while paused); estimate between server updates
-  const leftMin = Math.max(0, (d.remaining_min ?? d.timeout_min) - (speed ? ((now - (d.receivedAt || now)) / 1000) * speed / 60 : 0))
+  const leftMin = approvalMinutesLeft(d, now, speed)
   const leftWall = speed ? Math.ceil((leftMin * 60) / speed) : null
   const act = async (approved) => {
     setErr('')

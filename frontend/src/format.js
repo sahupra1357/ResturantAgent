@@ -51,3 +51,11 @@ export function describe(ev, state) {
     default: return ev.type
   }
 }
+
+// Service minutes left on an approval. Events from before service-minute timeouts carried remaining_s / timeout_s
+// (wall seconds); those are read as minutes-equivalent so replays of old logs show a number, not NaN.
+export function approvalMinutesLeft(d, now = Date.now(), speed = 0) {
+  const base = d.remaining_min ?? d.timeout_min ?? (d.remaining_s ?? d.timeout_s ?? 0) / 60
+  const spent = speed ? ((now - (d.receivedAt ?? now)) / 1000) * speed / 60 : 0
+  return Math.max(0, Number(base) - spent || 0)
+}

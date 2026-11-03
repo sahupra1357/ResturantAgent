@@ -83,8 +83,9 @@ restaurant_ops/
   data/                  catalog (20 dishes, 60 ingredients, 4 stations, 4 suppliers), synthetic generator, seed CLI,
                          importer.py (POS CSV -> covers / pos_sales)
   core/                  forecasting, inventory, optimizer, constraints (incl. live action types), menu, prep,
-                         suppliers.py (reliability learning), menu_engineering.py
-  tools/                 registry (LangChain tools) and the tools FastAPI app
+                         suppliers.py (reliability learning), menu_engineering.py,
+                         actions.py (DB effects of every action type, shared by the batch and live runtimes)
+  tools/                 registry (LangChain tools); the agents' only way to read and write the world
   agents/                batch planning graph (supervisor), LLM access, decision log, mock policies
   live/                  the real-time service
     events.py bus.py clock.py        event types, Redis Streams / in-process bus (degrades on Redis failure), clock
@@ -94,10 +95,14 @@ restaurant_ops/
     safety.py                        temperature log, HACCP checklist, waste analytics, donations
     menu_live.py metrics.py          tonight's menu state, KPIs
     agents/                          order, inventory, forecasting, procurement, menu, prep (+ base, LLM review)
-    coordinator.py                   LangGraph check -> interrupt -> verify -> execute (SQLite checkpoints)
-    scenarios.py service.py          disruptions; the orchestrator
-    persistence.py ops.py            snapshot / resume; JSON logs, Prometheus metrics, retention
-    server.py run.py replay.py       FastAPI + WebSocket + roles, headless runner, replay
+    coordinator.py handlers.py       LangGraph check -> interrupt -> verify -> execute; the executor per action type
+    service.py world.py              the orchestrator (lifecycle, step loop) and its shared constants
+    floor_ops.py order_flow.py       guests / seating / waiting area; order flow     (mixins of Service)
+    online_ops.py views.py           online channel; analytics, report, snapshot     (mixins of Service)
+    persistence.py recovery.py       snapshots (versioned, checksummed); restore from snapshot or event log
+    scenarios.py ops.py              disruptions; JSON logs, Prometheus metrics, retention, backups
+    server.py api/                   FastAPI app; routers by area (auth, service, floor, kitchen, office, admin, ws)
+    run.py replay.py llm_eval.py     headless runner, replay, LLM smoke test + eval set
   sim/                   day-by-day batch simulator + fixed-par baseline (the "agents vs baseline" slide)
 frontend/                React (Vite): 3D + 2D floor, online order page, manager dashboard; one WebSocket store;
                          vitest tests in src/__tests__
@@ -124,7 +129,7 @@ the whole demo works offline. LLM settings:
 | `*_API_KEY`, `*_MODEL`, `*_BASE_URL` | Per-provider settings (see `.env.example`). |
 | `EVENT_BUS` | `auto` (Redis Streams if `REDIS_URL` answers, else in-process), `redis`, or `memory`. |
 | `REDIS_URL` | Default `redis://localhost:6379/0`. |
-| `LIVE_PO_APPROVAL_THRESHOLD`, `LIVE_DISCARD_APPROVAL_VALUE`, `APPROVAL_TIMEOUT_S` | Approval policy for the live service (defaults $300, $50, 120 s). |
+| `LIVE_PO_APPROVAL_THRESHOLD`, `LIVE_DISCARD_APPROVAL_VALUE`, `APPROVAL_TIMEOUT_SIM_MIN` | Approval policy for the live service (defaults $300, $50, and 20 service minutes before the safe default applies; a paused clock freezes the countdown). |
 
 Redis is optional. To use Redis Streams, start a server before the backend:
 
@@ -324,6 +329,24 @@ uv run python -m restaurant_ops.live.llm_eval build
 uv run python -m restaurant_ops.live.llm_eval run --judge live --limit 50
 ```
 
+Before a pilot, check the provider end to end with one real review call. It goes through the same client, structured
+output and token accounting as the service, and prints the judgment, latency, tokens and cost (exit code 1 on
+failure):
+
+```bash
+uv run python -m restaurant_ops.live.llm_eval smoke
+```
+
+The same check runs as a test when you opt in (it is skipped without a key):
+
+```bash
+RUN_LIVE_LLM=1 uv run pytest tests/test_llm_live.py -s
+```
+
+The regular suite drives the live review path through the real Meta and OpenAI client classes with the HTTP
+transport mocked. That covers request shape, structured-output parsing, token usage, logging and the fall back to
+rules on an HTTP error, but not a real model's answers.
+
 ### Restarts
 
 The service saves its state every 5 service minutes and on every decision. Approvals that are waiting are LangGraph
@@ -403,8 +426,8 @@ report is a printable page (`/api/report.html`, Print → Save as PDF) and a CSV
 
 - Synthetic data only. Prices, demand and the demo numbers come from the seeded world and are not real-world
   figures.
-- Live LLM mode has not been exercised against a real provider in this repo's tests. Mock mode is what the tests
-  and the demo run.
+- No real provider is called in CI. The live review path is tested through the real client classes with mocked HTTP.
+  Run `llm_eval smoke` (or the opt-in `tests/test_llm_live.py`) with your key to check a real model.
 - Approval timeouts count service minutes (20 by default), so a paused clock freezes them.
 - Price suggestions assume an elasticity: the synthetic history never varies prices, so it can't be estimated. With
   real POS history that includes price changes, this is where an estimate would plug in.
@@ -413,8 +436,9 @@ report is a printable page (`/api/report.html`, Print → Save as PDF) and a CSV
 - Setup changes apply from the next service, not mid-service.
 - The Docker image and `docker-compose.yml` were not built in this repo's CI environment (no Docker daemon). The
   install script and the app run under the same commands as the documented local setup.
-- Tests share the real master database (`data/restaurant.db`) for read-mostly checks, so its audit log collects test
-  rows. Tests that edit setup use a private copy.
+- Each live service runs on its own copy of the master database. Only state meant to outlive a service is written
+  back: gift cards, users and the audit log, day closes, an approved "adjust tomorrow's forecast", and a prep list
+  saved for a later service. Stock, POs and orders of a service stay in its copy.
 - If Redis fails mid-service, the bus falls back to the in-process queue. Events published to Redis but not yet read
   at that moment are not re-dispatched, though they remain in the SQLite event log.
 - One service runs at a time per backend process. Each service gets its own DB copy under `data/live/`.

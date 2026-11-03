@@ -54,6 +54,17 @@ class PrepAgent(LiveAgent):
             n = int(r["portions"])
             self.prep[r["dish_id"]] = {"dish_id": r["dish_id"], "station": r["station"], "par": n, "prepped": n, "used": 0,
                                        "scratch": 0, "batches": 0}
+        from restaurant_ops.live.handlers import saved_prep_plan
+
+        plan = saved_prep_plan(svc)  # an approved prep_list for this service overrides the forecast pars
+        if plan:
+            for it in plan:
+                d = it["dish_id"]
+                if d in cat.DISHES_BY_ID:
+                    n = int(it["portions"])
+                    self.prep[d] = {"dish_id": d, "station": cat.DISHES_BY_ID[d].station, "par": n, "prepped": n, "used": 0,
+                                    "scratch": 0, "batches": 0}
+            trace.append({"tool": "saved_prep_plan", "args": {}, "result": {"dishes": len(plan)}})
         self.attach()
         self.publish(f"prep list from the forecast mix: {sum(v['par'] for v in self.prep.values())} portions across "
                      f"{len(self.prep)} dishes")
@@ -121,6 +132,24 @@ class PrepAgent(LiveAgent):
             f"Prep {portions} more {dish.name} ({minutes:.0f} min prep)",
             f"{p['prepped']} prepped vs {need:.0f} still forecast tonight; cooking from scratch is "
             f"{(settings.SCRATCH_PENALTY - 1) * 100:.0f}% slower", trace, key=f"prep:{d}:{int(now // 600)}", confidence=0.8)])
+
+    def apply_prep_list(self, items: list[dict]) -> dict:
+        """An approved prep list for tonight: new pars; where a par is above what is prepped, the difference goes to
+        the prep cook as one batch per dish (a lower par prepares nothing more)."""
+        batches = []
+        for it in items:
+            d, n = it["dish_id"], int(it["portions"])
+            dish = cat.DISHES_BY_ID[d]
+            p = self.prep.setdefault(d, {"dish_id": d, "station": dish.station, "par": 0, "prepped": 0, "used": 0, "scratch": 0,
+                                         "batches": 0})
+            p["par"] = n
+            more = n - p["prepped"] - sum(b["portions"] for b in self.batch_queue if b["dish_id"] == d)
+            if more > 0:
+                minutes = round(more * dish.prep_minutes * PREP_MIN_PER_PORTION / max(settings.PREP_COOKS, 1), 1)
+                batches.append({"dish_id": d, "portions": more,
+                                **self.run_batch({"dish_id": d, "portions": more, "prep_minutes": minutes})})
+        self.publish("prep list applied")
+        return {"pars": {it["dish_id"]: int(it["portions"]) for it in items}, "batches": batches}
 
     def run_batch(self, payload: dict) -> dict:
         now = self.svc.clock.t
