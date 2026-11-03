@@ -588,7 +588,7 @@ def test_llm_review_path_with_stub(monkeypatch, fail):
     from restaurant_ops.live.agents.base import Judgment
 
     monkeypatch.setattr(llm, "is_mock", lambda: False)
-    monkeypatch.setattr(llm, "get_llm", lambda: _FakeLLM(Judgment(keep=[0], rationale="STUB: salmon is short, 86 it", confidence=0.9), fail))
+    monkeypatch.setattr(llm, "get_review_llm", lambda: _FakeLLM(Judgment(keep=[0], rationale="STUB: salmon is short, 86 it", confidence=0.9), fail))
     svc = make("approve", ["salmon_short@18:00"])
     try:
         svc.run_headless(minutes=80)

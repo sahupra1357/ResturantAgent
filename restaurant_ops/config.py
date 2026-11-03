@@ -139,7 +139,8 @@ class Settings(BaseSettings):
     SNAPSHOT_KEEP: int = 3            # rotated service snapshots
 
     # --- LLM pilot guard ---
-    LLM_TIMEOUT_S: float = 12.0
+    LLM_TIMEOUT_S: float = 12.0                # live review: the HTTP request timeout and the service's wait
+    LLM_MAX_RETRIES: int = 0                   # live review: SDK retries inside that budget (a retry rarely fits)
     LLM_MAX_CALLS_PER_SERVICE: int = 150
     LLM_MAX_COST_PER_SERVICE: float = 2.0      # USD
     LLM_PRICE_IN_PER_MTOK: float = 3.0         # USD per million input tokens (set for your model)
@@ -164,6 +165,7 @@ class Settings(BaseSettings):
     META_BASE_URL: str = "https://api.meta.ai/v1"
     META_MODEL: str = "muse-spark-1.3"
     META_REASONING_EFFORT: str = ""  # optional reasoning_effort (e.g. "low" for faster cycles); empty = API default
+    META_REVIEW_REASONING_EFFORT: str = "low"  # the live review must answer within LLM_TIMEOUT_S; empty = API default
 
     OPENAI_API_KEY: str = ""
     OPENAI_BASE_URL: str = ""  # empty = api.openai.com

@@ -24,9 +24,9 @@ def test_real_provider_review(monkeypatch):
     from restaurant_ops.live import llm_eval
 
     monkeypatch.setattr(settings, "LLM_MODE", "live")
-    llm.get_llm.cache_clear()
+    llm.get_review_llm.cache_clear()
     r = llm_eval.smoke()
     print(json.dumps(r, indent=2))
     assert r["ok"], r.get("error")
-    assert r["keep"] or r["rationale"], "the model returned an empty judgment"
-    assert not r["ignored_indices"], "the model referred to candidates that do not exist"
+    assert r["review"]["keep"] or r["review"]["rationale"], "the model returned an empty judgment"
+    assert not r["review"]["ignored_indices"], "the model referred to candidates that do not exist"

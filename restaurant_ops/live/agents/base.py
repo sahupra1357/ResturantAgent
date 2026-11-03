@@ -130,12 +130,12 @@ def review_prompt(agent: str, situation: dict, proposals: list[dict]) -> str:
                                candidates=json.dumps(cands, default=str)[:3000])
 
 
-def _review(agent: str, situation: dict, proposals: list[dict]) -> dict:
+def _review(agent: str, situation: dict, proposals: list[dict], model=None) -> dict:
     """One model call (worker thread). Returns the judgment plus latency and token usage for the guard."""
     from langchain_core.messages import HumanMessage
 
     t0 = time.perf_counter()
-    out = llm.get_llm().with_structured_output(Judgment, include_raw=True).invoke(
+    out = (model or llm.get_review_llm()).with_structured_output(Judgment, include_raw=True).invoke(
         [HumanMessage(content=review_prompt(agent, situation, proposals))])
     raw = None
     if isinstance(out, dict):
